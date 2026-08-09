@@ -47,7 +47,10 @@ let package = Package(
         ),
         .testTarget(
             name: "BabylonSpeechTests",
-            dependencies: ["BabylonSpeech"]
+            dependencies: [
+                "BabylonSpeech",
+                .product(name: "BabylonAudio", package: "babylon.audio"),
+            ]
         ),
         .testTarget(
             name: "BabylonSpeechOpenAITests",
@@ -60,4 +63,3 @@ let package = Package(
     ],
     swiftLanguageModes: [.v6]
 )
-

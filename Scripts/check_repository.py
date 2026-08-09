@@ -20,7 +20,15 @@ FORBIDDEN_NEUTRAL_TERMS = {
     "AVAudioSession",
     "AVAudioEngine",
     "Keychain",
+    "JSONDecoder",
+    "JSONEncoder",
+    "Logger",
+    "OSLog",
+    "URLRequest",
+    "URLSession",
 }
+EVENT_DATA_TERMS = re.compile(r"\b(?:AudioFrame|Data)\b")
+FAILURE_BODY_TERMS = re.compile(r"\b(?:body|message|payload|underlyingError)\b", re.IGNORECASE)
 
 
 def repository_text_files():
@@ -48,6 +56,18 @@ for file_path in neutral_root.rglob("*.swift"):
         if term in text:
             fail(f"Forbidden neutral-target term {term!r} found in {file_path.relative_to(ROOT)}")
 
+event_contract = neutral_root / "SpeechEvents.swift"
+if event_contract.exists():
+    match = EVENT_DATA_TERMS.search(event_contract.read_text(encoding="utf-8"))
+    if match:
+        fail(f"Audio data term {match.group(0)!r} found in the speech event contract")
+
+failure_contract = neutral_root / "SpeechFailure.swift"
+if failure_contract.exists():
+    match = FAILURE_BODY_TERMS.search(failure_contract.read_text(encoding="utf-8"))
+    if match:
+        fail(f"Error-body term {match.group(0)!r} found in the public failure contract")
+
 if (ROOT / ".git").exists():
     result = subprocess.run(
         ["git", "log", "-1", "--pretty=%B"],
@@ -60,4 +80,3 @@ if (ROOT / ".git").exists():
         fail("Non-English CJK text found in the latest commit message")
 
 print("Repository language and neutral-target boundary checks passed.")
-
