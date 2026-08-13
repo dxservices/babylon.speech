@@ -9,7 +9,15 @@ import sys
 ROOT = Path(__file__).resolve().parent.parent
 IGNORED_PARTS = {".build", ".git", ".swiftpm"}
 CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
-TEXT_SUFFIXES = {".md", ".py", ".swift", ".yml", ".yaml"}
+TEXT_SUFFIXES = {".json", ".md", ".py", ".swift", ".txt", ".yml", ".yaml"}
+EXPLICIT_TEXT_FILENAMES = {
+    ".gitattributes",
+    ".gitignore",
+    "AUTHORS",
+    "COPYING",
+    "LICENSE",
+    "NOTICE",
+}
 FORBIDDEN_NEUTRAL_TERMS = {
     "OpenAI",
     "Google",
@@ -35,7 +43,7 @@ def repository_text_files():
     for path in ROOT.rglob("*"):
         if not path.is_file() or any(part in IGNORED_PARTS for part in path.parts):
             continue
-        if path.suffix in TEXT_SUFFIXES or path.name in {"Package.swift", "AGENTS.md"}:
+        if path.suffix in TEXT_SUFFIXES or path.name in EXPLICIT_TEXT_FILENAMES:
             yield path
 
 
@@ -69,14 +77,28 @@ if failure_contract.exists():
         fail(f"Error-body term {match.group(0)!r} found in the public failure contract")
 
 if (ROOT / ".git").exists():
-    result = subprocess.run(
-        ["git", "log", "-1", "--pretty=%B"],
+    shallow_result = subprocess.run(
+        ["git", "rev-parse", "--is-shallow-repository"],
         cwd=ROOT,
         check=False,
         capture_output=True,
         text=True,
     )
-    if result.returncode == 0 and CJK.search(result.stdout):
-        fail("Non-English CJK text found in the latest commit message")
+    if shallow_result.returncode != 0:
+        fail("Unable to determine whether Git history is complete")
+    if shallow_result.stdout.strip() == "true":
+        fail("Full Git history is required for commit-message checks")
+
+    result = subprocess.run(
+        ["git", "log", "--all", "--format=%B"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        fail("Unable to inspect reachable commit messages")
+    if CJK.search(result.stdout):
+        fail("Non-English CJK text found in reachable commit history")
 
 print("Repository language and neutral-target boundary checks passed.")

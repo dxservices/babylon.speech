@@ -2,7 +2,7 @@
 
 BabylonSpeech is a provider-neutral real-time speech-intelligence Swift package built on BabylonAudio.
 
-The package is in its initial pre-0.1 scaffold. It does not expose a usable public API or provider adapter yet.
+The package is pre-0.1. Its provider-neutral session contracts are available, while the provider adapter products remain placeholders.
 
 ## Requirements
 
@@ -35,6 +35,31 @@ It does not own:
 
 Provider adapters accept explicitly injected authorization material and report structured failures. The consuming application decides recovery.
 
+## Session channels
+
+Starting a provider session returns `SpeechSessionChannels`. The handle binds its event, uplink, and optional downlink channels to one `SpeechSessionID` and its `AudioFlowID`.
+
+```swift
+let channels = try await provider.startSession(configuration)
+
+// This is the application injection point for captured or external PCM.
+try await channels.uplink.send(audioFrame)
+
+for await event in channels.events {
+    // SpeechEvent carries text and lifecycle facts, never PCM.
+}
+
+if let downlink = channels.downlink {
+    for try await translatedFrame in downlink.frames(
+        for: channels.sessionID.audioFlowID
+    ) {
+        // Route the frame into the BabylonAudio downlink data plane.
+    }
+}
+```
+
+`downlink` is `nil` for providers that produce no audio, including transcription-only or local-model implementations. Consumers holding only `any SpeechProvider` receive all channels from `startSession`; provider-specific downcasts are not part of the contract.
+
 ## Development
 
 ```sh
@@ -43,6 +68,8 @@ swift test
 swift build
 python3 Scripts/check_repository.py
 ```
+
+The repository check requires a non-shallow Git checkout and scans every commit reachable from local refs. CI must fetch full history.
 
 ## License
 
