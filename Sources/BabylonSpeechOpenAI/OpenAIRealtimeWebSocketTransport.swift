@@ -60,13 +60,39 @@ private final class TaskRealtimeScheduler: OpenAIRealtimeScheduler {
 }
 
 @available(iOS 18, macOS 13, *)
+enum OpenAIRealtimeCloseOutcome: Equatable, Sendable {
+    case serverAcknowledged
+    case localGraceful
+    case localImmediate
+    case localForcedAfterTimeout
+    case waitCancelled
+    case failed
+}
+
+@available(iOS 18, macOS 13, *)
 @MainActor
 final class OpenAIRealtimeWebSocketTransport {
     typealias ConnectionFactory = @MainActor (URLRequest)
         -> any OpenAIRealtimeWebSocketConnection
     typealias PostUpdateValidationHook = @MainActor @Sendable () async -> Void
+    typealias CloseWaiterCancellationAction =
+        @MainActor @Sendable () -> Void
+    typealias CloseWaiterCancellationHook =
+        @MainActor @Sendable (
+            @escaping CloseWaiterCancellationAction
+        ) async -> Void
+
+    private struct CloseWaiter {
+        let connectionGeneration: UInt64
+        let closeAttemptGeneration: UInt64
+        let continuation:
+            CheckedContinuation<OpenAIRealtimeCloseOutcome, Never>
+    }
 
     static let openTimeout: Duration = .seconds(12)
+    static let pingInterval: Duration = .seconds(15)
+    static let pingResponseTimeout: Duration = .seconds(10)
+    static let closeDrainTimeout: Duration = .seconds(10)
 
     var onEvent: (
         @MainActor @Sendable (OpenAIRealtimeDecodedEvent) -> Void
@@ -77,26 +103,41 @@ final class OpenAIRealtimeWebSocketTransport {
     private let connectionFactory: ConnectionFactory
     private let scheduler: any OpenAIRealtimeScheduler
     private let postUpdateValidationHook: PostUpdateValidationHook?
+    private let closeWaiterCancellationHook: CloseWaiterCancellationHook?
     private var connection: (any OpenAIRealtimeWebSocketConnection)?
     private var openContinuation:
         CheckedContinuation<Result<Void, SpeechProviderFailure>, Never>?
     private var updateContinuation:
         CheckedContinuation<Result<Void, SpeechProviderFailure>, Never>?
     private var openTimeoutTask: (any OpenAIRealtimeScheduledTask)?
+    private var pingIntervalTask: (any OpenAIRealtimeScheduledTask)?
+    private var pingResponseTimeoutTask: (any OpenAIRealtimeScheduledTask)?
+    private var closeDrainTimeoutTask: (any OpenAIRealtimeScheduledTask)?
+    private var closeWaiters: [UInt64: CloseWaiter] = [:]
     private var generation: UInt64 = 0
+    private var pingAttemptGeneration: UInt64 = 0
+    private var closeAttemptGeneration: UInt64 = 0
+    private var closeWaiterGeneration: UInt64 = 0
     private var activeGeneration: UInt64?
+    private var pendingPingAttemptGeneration: UInt64?
+    private var closeGeneration: UInt64?
+    private var activeCloseAttemptGeneration: UInt64?
     private var pendingPostUpdateValidationGeneration: UInt64?
     private var terminalAfterSuccessfulUpdateGeneration: UInt64?
+    private var closeOutcome: OpenAIRealtimeCloseOutcome?
+    private var consecutivePongFailures = 0
     private var isOpen = false
     private var isConnected = false
     private var isCancelled = false
+    private var isGracefulCloseDraining = false
 
     init(
         authorization: OpenAIRealtimeAuthorization,
         wireCodec: OpenAIRealtimeWireCodec = OpenAIRealtimeWireCodec(),
         connectionFactory: ConnectionFactory? = nil,
         scheduler: (any OpenAIRealtimeScheduler)? = nil,
-        postUpdateValidationHook: PostUpdateValidationHook? = nil
+        postUpdateValidationHook: PostUpdateValidationHook? = nil,
+        closeWaiterCancellationHook: CloseWaiterCancellationHook? = nil
     ) {
         self.authorization = authorization
         self.wireCodec = wireCodec
@@ -105,6 +146,7 @@ final class OpenAIRealtimeWebSocketTransport {
         }
         self.scheduler = scheduler ?? TaskRealtimeScheduler()
         self.postUpdateValidationHook = postUpdateValidationHook
+        self.closeWaiterCancellationHook = closeWaiterCancellationHook
     }
 
     func connect(
@@ -137,8 +179,19 @@ final class OpenAIRealtimeWebSocketTransport {
         try result.get()
     }
 
-    func cancelImmediately() {
-        guard activeGeneration != nil || connection != nil else { return }
+    @discardableResult
+    func cancelImmediately() -> OpenAIRealtimeCloseOutcome {
+        if closeOutcome == nil,
+           closeGeneration != nil || !closeWaiters.isEmpty
+        {
+            finishGracefulClose(
+                with: .localImmediate,
+                terminate: false
+            )
+        }
+        guard activeGeneration != nil || connection != nil else {
+            return .localImmediate
+        }
         let failure = Self.failure(
             classification: .network,
             type: "network_error",
@@ -147,6 +200,60 @@ final class OpenAIRealtimeWebSocketTransport {
         finishOpen(with: .failure(failure))
         finishUpdate(with: .failure(failure))
         terminateConnection()
+        return .localImmediate
+    }
+
+    func closeGracefully() async -> OpenAIRealtimeCloseOutcome {
+        if let closeOutcome {
+            return closeOutcome
+        }
+        if Task.isCancelled {
+            return .waitCancelled
+        }
+
+        closeWaiterGeneration &+= 1
+        let waiterToken = closeWaiterGeneration
+        let expectedConnectionGeneration = activeGeneration
+        let expectedCloseAttemptGeneration =
+            activeCloseAttemptGeneration ?? closeAttemptGeneration &+ 1
+
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else {
+                return .waitCancelled
+            }
+            return await withCheckedContinuation { continuation in
+                if let closeOutcome {
+                    continuation.resume(returning: closeOutcome)
+                    return
+                }
+                if Task.isCancelled {
+                    continuation.resume(returning: .waitCancelled)
+                    return
+                }
+                registerGracefulCloseWaiter(
+                    token: waiterToken,
+                    continuation: continuation
+                )
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let action: CloseWaiterCancellationAction = {
+                    [weak self] in
+                    self?.cancelGracefulCloseWaiter(
+                        token: waiterToken,
+                        connectionGeneration: expectedConnectionGeneration,
+                        closeAttemptGeneration:
+                            expectedCloseAttemptGeneration
+                    )
+                }
+                if let closeWaiterCancellationHook {
+                    await closeWaiterCancellationHook(action)
+                } else {
+                    action()
+                }
+            }
+        }
     }
 
     private func beginConnect(
@@ -173,6 +280,7 @@ final class OpenAIRealtimeWebSocketTransport {
         }
 
         cancelImmediately()
+        resetCloseStateForNewConnection()
         activeGeneration = currentGeneration
         isCancelled = false
         isOpen = false
@@ -273,6 +381,7 @@ final class OpenAIRealtimeWebSocketTransport {
         }
 
         pendingPostUpdateValidationGeneration = nil
+        scheduleNextPing(generation: currentGeneration)
         return .success(())
     }
 
@@ -286,8 +395,8 @@ final class OpenAIRealtimeWebSocketTransport {
         connection.onMessage = { [weak self] result in
             self?.socketDidReceive(result, generation: generation)
         }
-        connection.onClose = { [weak self] _ in
-            self?.socketDidClose(generation: generation)
+        connection.onClose = { [weak self] error in
+            self?.socketDidClose(error: error, generation: generation)
         }
     }
 
@@ -311,7 +420,19 @@ final class OpenAIRealtimeWebSocketTransport {
 
         switch result {
         case let .success(message):
-            onEvent?(wireCodec.decode(message))
+            let event = wireCodec.decode(message)
+            onEvent?(event)
+            if event == .sessionClosed {
+                if closeGeneration == generation {
+                    finishGracefulClose(
+                        with: .serverAcknowledged,
+                        terminate: true
+                    )
+                } else {
+                    terminateConnection(generation: generation)
+                }
+                return
+            }
             receiveNext(generation: generation)
         case .failure:
             handleEstablishedConnectionFailure(
@@ -325,10 +446,23 @@ final class OpenAIRealtimeWebSocketTransport {
         }
     }
 
-    private func socketDidClose(generation: UInt64) {
+    private func socketDidClose(
+        error: (any Error)?,
+        generation: UInt64
+    ) {
         guard activeGeneration == generation,
               !isCancelled
         else { return }
+        if closeGeneration == generation,
+           isGracefulCloseDraining,
+           error == nil
+        {
+            finishGracefulClose(
+                with: .localGraceful,
+                terminate: true
+            )
+            return
+        }
         let failure = Self.failure(
             classification: .network,
             type: "network_error",
@@ -382,6 +516,9 @@ final class OpenAIRealtimeWebSocketTransport {
         _ failure: SpeechProviderFailure,
         generation: UInt64
     ) {
+        if closeGeneration == generation {
+            finishGracefulClose(with: .failed, terminate: false)
+        }
         onEvent?(.providerFailure(failure))
         if pendingPostUpdateValidationGeneration == generation {
             terminalAfterSuccessfulUpdateGeneration = generation
@@ -393,6 +530,7 @@ final class OpenAIRealtimeWebSocketTransport {
 
     private func terminateSocketPreservingGeneration(_ generation: UInt64) {
         guard activeGeneration == generation else { return }
+        cancelPingTasks()
         if let connection {
             connection.onOpen = nil
             connection.onMessage = nil
@@ -418,6 +556,12 @@ final class OpenAIRealtimeWebSocketTransport {
 
     private func cancelForCaller(generation: UInt64) {
         guard activeGeneration == generation else { return }
+        if closeGeneration == generation {
+            finishGracefulClose(
+                with: .localImmediate,
+                terminate: false
+            )
+        }
         let failure = Self.failure(
             classification: .network,
             type: "network_error",
@@ -426,6 +570,237 @@ final class OpenAIRealtimeWebSocketTransport {
         finishOpen(with: .failure(failure))
         finishUpdate(with: .failure(failure))
         terminateConnection()
+    }
+
+    private func scheduleNextPing(generation: UInt64) {
+        guard activeGeneration == generation,
+              isConnected,
+              !isCancelled,
+              !isGracefulCloseDraining,
+              pendingPingAttemptGeneration == nil
+        else { return }
+        pingIntervalTask?.cancel()
+        pingIntervalTask = scheduler.schedule(
+            after: Self.pingInterval
+        ) { [weak self] in
+            self?.beginPing(generation: generation)
+        }
+    }
+
+    private func beginPing(generation: UInt64) {
+        guard activeGeneration == generation,
+              isConnected,
+              !isCancelled,
+              !isGracefulCloseDraining,
+              pendingPingAttemptGeneration == nil,
+              let connection
+        else { return }
+        pingIntervalTask = nil
+        pingAttemptGeneration &+= 1
+        let attemptGeneration = pingAttemptGeneration
+        pendingPingAttemptGeneration = attemptGeneration
+        pingResponseTimeoutTask = scheduler.schedule(
+            after: Self.pingResponseTimeout
+        ) { [weak self] in
+            self?.pingCompleted(
+                succeeded: false,
+                attemptGeneration: attemptGeneration,
+                connectionGeneration: generation
+            )
+        }
+        connection.sendPing { [weak self] error in
+            self?.pingCompleted(
+                succeeded: error == nil,
+                attemptGeneration: attemptGeneration,
+                connectionGeneration: generation
+            )
+        }
+    }
+
+    private func pingCompleted(
+        succeeded: Bool,
+        attemptGeneration: UInt64,
+        connectionGeneration: UInt64
+    ) {
+        guard activeGeneration == connectionGeneration,
+              pendingPingAttemptGeneration == attemptGeneration
+        else { return }
+        pendingPingAttemptGeneration = nil
+        pingResponseTimeoutTask?.cancel()
+        pingResponseTimeoutTask = nil
+
+        if succeeded {
+            consecutivePongFailures = 0
+            scheduleNextPing(generation: connectionGeneration)
+            return
+        }
+
+        consecutivePongFailures += 1
+        guard consecutivePongFailures >= 2 else {
+            scheduleNextPing(generation: connectionGeneration)
+            return
+        }
+        handleEstablishedConnectionFailure(
+            Self.failure(
+                classification: .network,
+                type: "network_error",
+                code: "pong_unresponsive"
+            ),
+            generation: connectionGeneration
+        )
+    }
+
+    private func cancelPingTasks() {
+        pingIntervalTask?.cancel()
+        pingIntervalTask = nil
+        pingResponseTimeoutTask?.cancel()
+        pingResponseTimeoutTask = nil
+        pendingPingAttemptGeneration = nil
+        consecutivePongFailures = 0
+    }
+
+    private func registerGracefulCloseWaiter(
+        token: UInt64,
+        continuation: CheckedContinuation<
+            OpenAIRealtimeCloseOutcome,
+            Never
+        >
+    ) {
+        var connectionToSend:
+            (any OpenAIRealtimeWebSocketConnection)?
+        var closeEventToSend: String?
+
+        if closeGeneration == nil {
+            guard let currentGeneration = activeGeneration,
+                  isConnected,
+                  !isCancelled,
+                  let connection
+            else {
+                finishGracefulClose(
+                    with: .localImmediate,
+                    terminate: false
+                )
+                cancelImmediately()
+                continuation.resume(returning: .localImmediate)
+                return
+            }
+            guard let closeEvent = wireCodec.sessionCloseEvent() else {
+                finishGracefulClose(with: .failed, terminate: true)
+                continuation.resume(returning: .failed)
+                return
+            }
+
+            closeAttemptGeneration &+= 1
+            let attemptGeneration = closeAttemptGeneration
+            closeGeneration = currentGeneration
+            activeCloseAttemptGeneration = attemptGeneration
+            isGracefulCloseDraining = true
+            cancelPingTasks()
+            closeDrainTimeoutTask = scheduler.schedule(
+                after: Self.closeDrainTimeout
+            ) { [weak self] in
+                self?.gracefulCloseTimedOut(
+                    generation: currentGeneration
+                )
+            }
+            connectionToSend = connection
+            closeEventToSend = closeEvent
+        }
+
+        guard let currentGeneration = closeGeneration,
+              let attemptGeneration = activeCloseAttemptGeneration
+        else {
+            continuation.resume(returning: closeOutcome ?? .failed)
+            return
+        }
+        closeWaiters[token] = CloseWaiter(
+            connectionGeneration: currentGeneration,
+            closeAttemptGeneration: attemptGeneration,
+            continuation: continuation
+        )
+
+        if let connectionToSend,
+           let closeEventToSend
+        {
+            connectionToSend.send(text: closeEventToSend) {
+                [weak self] error in
+                self?.gracefulCloseSendCompleted(
+                    succeeded: error == nil,
+                    generation: currentGeneration
+                )
+            }
+        }
+    }
+
+    private func gracefulCloseSendCompleted(
+        succeeded: Bool,
+        generation: UInt64
+    ) {
+        guard closeOutcome == nil,
+              closeGeneration == generation,
+              activeGeneration == generation
+        else { return }
+        guard succeeded else {
+            finishGracefulClose(with: .failed, terminate: true)
+            return
+        }
+    }
+
+    private func gracefulCloseTimedOut(generation: UInt64) {
+        guard closeOutcome == nil,
+              closeGeneration == generation,
+              activeGeneration == generation,
+              isGracefulCloseDraining
+        else { return }
+        finishGracefulClose(
+            with: .localForcedAfterTimeout,
+            terminate: true
+        )
+    }
+
+    private func cancelGracefulCloseWaiter(
+        token: UInt64,
+        connectionGeneration: UInt64?,
+        closeAttemptGeneration: UInt64
+    ) {
+        guard let connectionGeneration,
+              let waiter = closeWaiters[token],
+              waiter.connectionGeneration == connectionGeneration,
+              waiter.closeAttemptGeneration == closeAttemptGeneration
+        else { return }
+        closeWaiters.removeValue(forKey: token)
+        waiter.continuation.resume(returning: .waitCancelled)
+    }
+
+    private func finishGracefulClose(
+        with outcome: OpenAIRealtimeCloseOutcome,
+        terminate: Bool
+    ) {
+        guard closeOutcome == nil else { return }
+        closeOutcome = outcome
+        closeDrainTimeoutTask?.cancel()
+        closeDrainTimeoutTask = nil
+        closeGeneration = nil
+        activeCloseAttemptGeneration = nil
+        isGracefulCloseDraining = false
+        let waiters = Array(closeWaiters.values)
+        closeWaiters.removeAll(keepingCapacity: false)
+        if terminate {
+            terminateConnection()
+        }
+        for waiter in waiters {
+            waiter.continuation.resume(returning: outcome)
+        }
+    }
+
+    private func resetCloseStateForNewConnection() {
+        closeDrainTimeoutTask?.cancel()
+        closeDrainTimeoutTask = nil
+        closeGeneration = nil
+        activeCloseAttemptGeneration = nil
+        closeOutcome = nil
+        closeWaiters.removeAll(keepingCapacity: false)
+        isGracefulCloseDraining = false
     }
 
     private func finishOpen(
@@ -450,6 +825,9 @@ final class OpenAIRealtimeWebSocketTransport {
         if let generation, activeGeneration != generation { return }
         openTimeoutTask?.cancel()
         openTimeoutTask = nil
+        cancelPingTasks()
+        closeDrainTimeoutTask?.cancel()
+        closeDrainTimeoutTask = nil
         if let connection {
             connection.onOpen = nil
             connection.onMessage = nil

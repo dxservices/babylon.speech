@@ -472,10 +472,454 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(socket.cancelCallCount, 1)
     }
 
-    func testImmediateCancelIsIdempotentAndDetachesCallbacks() async throws {
+    func testPingStartsOnlyAfterPostUpdateValidationCompletes()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let gate = TestRealtimePostUpdateGate()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in socket },
+            scheduler: scheduler,
+            postUpdateValidationHook: { await gate.waitOnFirstCall() }
+        )
+        let task = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "fr",
+                transcriptionRequested: true
+            )
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+        socket.emitOpen()
+        await waitUntil { socket.sentTexts.count == 1 }
+        socket.completeNextSend()
+        await waitUntil { gate.isWaiting }
+
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        gate.open()
+        try await task.value
+
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(15)))
+    }
+
+    func testPingHasNoOverlapAndSuccessfulPongRearmsInterval()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        try await finishConnect(transport, socket: socket)
+
+        scheduler.advance(by: .seconds(15))
+        XCTAssertEqual(socket.pingCallCount, 1)
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+
+        scheduler.advance(by: .seconds(15))
+        XCTAssertEqual(socket.pingCallCount, 1)
+        socket.completeNextPing()
+
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(15)))
+        XCTAssertEqual(socket.cancelCallCount, 0)
+    }
+
+    func testOnePingFailureRetriesAndSuccessfulPongResetsFailureCount()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+
+        scheduler.advance(by: .seconds(15))
+        socket.completeNextPing(error: SensitiveTestError("first"))
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(15)))
+
+        scheduler.advance(by: .seconds(15))
+        socket.completeNextPing()
+        scheduler.advance(by: .seconds(15))
+        socket.completeNextPing(error: SensitiveTestError("after reset"))
+
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 0)
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(15)))
+    }
+
+    func testPingTimeoutIgnoresLateCompletionAndSecondFailureTerminates()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+
+        scheduler.advance(by: .seconds(15))
+        scheduler.advance(by: .seconds(10))
+        socket.completeNextPing()
+        scheduler.advance(by: .seconds(15))
+        socket.completeNextPing(error: SensitiveTestError("second"))
+
+        XCTAssertEqual(events.count, 1)
+        guard case let .providerFailure(failure) = events[0] else {
+            return XCTFail("Expected liveness failure")
+        }
+        XCTAssertEqual(failure.classification, .network)
+        XCTAssertEqual(failure.type.value, "network_error")
+        XCTAssertEqual(failure.code?.value, "pong_unresponsive")
+        XCTAssertFalse(String(describing: events).contains("second"))
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+
+        socket.completeNextPing(error: SensitiveTestError("late"))
+        scheduler.advance(by: .seconds(10))
+        scheduler.advance(by: .seconds(15))
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testGracefulCloseAcknowledgementStopsPingsAndForwardsClosedEvent()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+        let receiveCountBeforeClose = socket.receiveCallCount
+
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        XCTAssertEqual(
+            try jsonObject(socket.sentTexts[1])["type"] as? String,
+            "session.close"
+        )
+        socket.completeNextSend()
+
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertEqual(socket.receiveCallCount, receiveCountBeforeClose)
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .serverAcknowledged)
+        XCTAssertEqual(events, [.sessionClosed])
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+    }
+
+    func testGracefulCloseSendFailureFailsAndTerminatesImmediately()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        socket.completeNextSend(
+            error: SensitiveTestError("private close send error")
+        )
+
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .failed)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertFalse(String(describing: closeOutcome).contains(
+            "private"
+        ))
+    }
+
+    func testGracefulCloseTimeoutIsForcedAndLateSignalsAreIgnored()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        socket.completeNextSend()
+
+        scheduler.advance(by: .seconds(10))
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .localForcedAfterTimeout)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        socket.emitClose(SensitiveTestError("late close"))
+        scheduler.advance(by: .seconds(10))
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertEqual(closeOutcome, .localForcedAfterTimeout)
+    }
+
+    func testGracefulCloseTimesOutWhenSendCompletionNeverReturns()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+        scheduler.advance(by: .seconds(15))
+        XCTAssertEqual(socket.pingCallCount, 0)
+
+        scheduler.advance(by: .seconds(10))
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .localForcedAfterTimeout)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+
+        socket.completeNextSend()
+        scheduler.advance(by: .seconds(10))
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testNormalCloseWhileGracefulSendIsPendingCompletesLocally()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        socket.emitClose(nil)
+
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .localGraceful)
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        socket.completeNextSend(error: SensitiveTestError("late send"))
+        scheduler.advance(by: .seconds(10))
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testNormalCloseAfterGracefulSendSuccessCompletesLocally()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        socket.completeNextSend()
+
+        socket.emitClose(nil)
+
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .localGraceful)
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        scheduler.advance(by: .seconds(10))
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testGracefulSocketFailureWinsOverLateTimeoutAndClosedEvent()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+        let closeTask = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        socket.completeNextSend()
+
+        socket.emitClose(SensitiveTestError("private socket close"))
+
+        let closeOutcome = await closeTask.value
+        XCTAssertEqual(closeOutcome, .failed)
+        XCTAssertEqual(events.count, 1)
+        guard case let .providerFailure(failure) = events[0] else {
+            return XCTFail("Expected network failure")
+        }
+        XCTAssertEqual(failure.classification, .network)
+        XCTAssertEqual(failure.type.value, "network_error")
+        XCTAssertEqual(failure.code?.value, "connection_closed")
+        XCTAssertFalse(String(describing: events).contains("private"))
+        XCTAssertEqual(socket.cancelCallCount, 1)
+
+        scheduler.advance(by: .seconds(10))
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testRepeatedGracefulCloseSendsOnceAndWaitersShareOutcome()
+        async throws
+    {
         let socket = FakeRealtimeWebSocketConnection()
         let transport = makeTransport(socket: socket)
         try await finishConnect(transport, socket: socket)
+
+        let first = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let second = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await Task.yield()
+        XCTAssertEqual(socket.sentTexts.count, 2)
+
+        socket.completeNextSend()
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+
+        let firstOutcome = await first.value
+        let secondOutcome = await second.value
+        XCTAssertEqual(firstOutcome, .serverAcknowledged)
+        XCTAssertEqual(secondOutcome, .serverAcknowledged)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testGracefulWaiterCancellationIsLocalAndOtherWaiterCanAcknowledge()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        try await finishConnect(transport, socket: socket)
+        var firstOutcome: OpenAIRealtimeCloseOutcome?
+        var secondOutcome: OpenAIRealtimeCloseOutcome?
+        var secondStarted = false
+        let first = Task { @MainActor in
+            firstOutcome = await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let second = Task { @MainActor in
+            secondStarted = true
+            secondOutcome = await transport.closeGracefully()
+        }
+        await waitUntil { secondStarted }
+
+        first.cancel()
+
+        await waitUntil { firstOutcome != nil }
+        XCTAssertEqual(firstOutcome, .waitCancelled)
+        XCTAssertEqual(socket.cancelCallCount, 0)
+        XCTAssertEqual(socket.sentTexts.count, 2)
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        socket.completeNextSend()
+
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+
+        await waitUntil { secondOutcome != nil }
+        XCTAssertEqual(secondOutcome, .serverAcknowledged)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        _ = first
+        _ = second
+    }
+
+    func testNormalSessionClosedForwardsEventAndTerminates()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: socket)
+
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+
+        XCTAssertEqual(events, [.sessionClosed])
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+    }
+
+    func testImmediateCancelIsIdempotentAndDetachesCallbacks() async throws {
+        let socket = FakeRealtimeWebSocketConnection()
+        socket.automaticallyCompletesPings = false
+        let scheduler = TestRealtimeScheduler()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler
+        )
+        try await finishConnect(transport, socket: socket)
+        scheduler.advance(by: .seconds(15))
 
         transport.cancelImmediately()
         transport.cancelImmediately()
@@ -484,6 +928,116 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertNil(socket.onOpen)
         XCTAssertNil(socket.onMessage)
         XCTAssertNil(socket.onClose)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        socket.completeNextPing(error: SensitiveTestError("late ping"))
+        XCTAssertEqual(socket.cancelCallCount, 1)
+    }
+
+    func testReplacementCancelsOutstandingPingAndIgnoresLatePong()
+        async throws
+    {
+        let firstSocket = FakeRealtimeWebSocketConnection()
+        firstSocket.automaticallyCompletesPings = false
+        let secondSocket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        var connectionIndex = 0
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in
+                defer { connectionIndex += 1 }
+                return connectionIndex == 0 ? firstSocket : secondSocket
+            },
+            scheduler: scheduler
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        try await finishConnect(transport, socket: firstSocket)
+        scheduler.advance(by: .seconds(15))
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+
+        let replacement = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "de",
+                transcriptionRequested: false
+            )
+        }
+        await waitUntil { secondSocket.resumeCallCount == 1 }
+
+        XCTAssertEqual(firstSocket.cancelCallCount, 1)
+        XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
+        firstSocket.completeNextPing(
+            error: SensitiveTestError("late replaced ping")
+        )
+        XCTAssertTrue(events.isEmpty)
+
+        secondSocket.emitOpen()
+        await waitUntil { secondSocket.sentTexts.count == 1 }
+        secondSocket.completeNextSend()
+        try await replacement.value
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(15)))
+    }
+
+    func testBlockedOldWaiterCancellationCannotAffectReplacementClose()
+        async throws
+    {
+        let firstSocket = FakeRealtimeWebSocketConnection()
+        let secondSocket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let cancellationGate = TestRealtimeCancellationGate()
+        var connectionIndex = 0
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in
+                defer { connectionIndex += 1 }
+                return connectionIndex == 0 ? firstSocket : secondSocket
+            },
+            scheduler: scheduler,
+            closeWaiterCancellationHook: { action in
+                await cancellationGate.waitBeforeRunning(action)
+            }
+        )
+        try await finishConnect(transport, socket: firstSocket)
+        let oldWaiter = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { firstSocket.sentTexts.count == 2 }
+        oldWaiter.cancel()
+        await waitUntil { cancellationGate.isWaiting }
+
+        let replacement = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "de",
+                transcriptionRequested: false
+            )
+        }
+        await waitUntil { secondSocket.resumeCallCount == 1 }
+        secondSocket.emitOpen()
+        await waitUntil { secondSocket.sentTexts.count == 1 }
+        secondSocket.completeNextSend()
+        try await replacement.value
+        let oldOutcome = await oldWaiter.value
+        XCTAssertEqual(oldOutcome, .localImmediate)
+
+        var newOutcome: OpenAIRealtimeCloseOutcome?
+        let newWaiter = Task { @MainActor in
+            newOutcome = await transport.closeGracefully()
+        }
+        await waitUntil { secondSocket.sentTexts.count == 2 }
+        cancellationGate.open()
+        await waitUntil { cancellationGate.didRunAction }
+
+        XCTAssertNil(newOutcome)
+        XCTAssertEqual(secondSocket.cancelCallCount, 0)
+        XCTAssertTrue(scheduler.hasActiveTask(after: .seconds(10)))
+        secondSocket.completeNextSend()
+        secondSocket.emitMessage(.string(
+            #"{"type":"session.closed"}"#
+        ))
+        await waitUntil { newOutcome != nil }
+        XCTAssertEqual(newOutcome, .serverAcknowledged)
+        XCTAssertEqual(secondSocket.cancelCallCount, 1)
+        _ = newWaiter
     }
 
     func testURLSessionConnectionSatisfiesCompileAndSendableSeam() {
@@ -674,7 +1228,11 @@ private final class FakeRealtimeWebSocketConnection:
     private(set) var sentTexts: [String] = []
     private(set) var pingCallCount = 0
     private(set) var cancelCallCount = 0
+    var automaticallyCompletesPings = true
     private var sendCompletions: [
+        @MainActor @Sendable ((any Error)?) -> Void
+    ] = []
+    private var pingCompletions: [
         @MainActor @Sendable ((any Error)?) -> Void
     ] = []
 
@@ -699,7 +1257,11 @@ private final class FakeRealtimeWebSocketConnection:
         completion: @escaping @MainActor @Sendable ((any Error)?) -> Void
     ) {
         pingCallCount += 1
-        completion(nil)
+        if automaticallyCompletesPings {
+            completion(nil)
+        } else {
+            pingCompletions.append(completion)
+        }
     }
 
     func cancel() {
@@ -725,6 +1287,11 @@ private final class FakeRealtimeWebSocketConnection:
     func completeNextSend(error: (any Error)? = nil) {
         guard !sendCompletions.isEmpty else { return }
         sendCompletions.removeFirst()(error)
+    }
+
+    func completeNextPing(error: (any Error)? = nil) {
+        guard !pingCompletions.isEmpty else { return }
+        pingCompletions.removeFirst()(error)
     }
 }
 
@@ -798,6 +1365,31 @@ private final class TestRealtimePostUpdateGate {
         await withCheckedContinuation { continuation in
             self.continuation = continuation
         }
+    }
+
+    func open() {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
+    }
+}
+
+@available(iOS 18, macOS 13, *)
+@MainActor
+private final class TestRealtimeCancellationGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var didRunAction = false
+
+    var isWaiting: Bool { continuation != nil }
+
+    func waitBeforeRunning(
+        _ action: @escaping @MainActor @Sendable () -> Void
+    ) async {
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+        action()
+        didRunAction = true
     }
 
     func open() {
