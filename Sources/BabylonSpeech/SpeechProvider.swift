@@ -10,9 +10,12 @@ public struct SpeechProviderCapabilities: Equatable, Sendable {
     public let requiresNetwork: Bool
     public let credentialRequirement: SpeechCredentialRequirement
     public let supportedFeatures: Set<SpeechFeature>
+    /// Features every supported configuration must request, not fixed output.
+    public let requiredFeatures: Set<SpeechFeature>
     public let acceptedInputFormats: [AudioStreamFormat]
     public let outputAudioFormats: [AudioStreamFormat]
     public let supportsAutomaticSourceLanguage: Bool
+    public let supportsExplicitSourceLanguage: Bool
     public let reportsDetectedSourceLanguage: Bool
 
     public var requiresCredential: Bool {
@@ -26,14 +29,18 @@ public struct SpeechProviderCapabilities: Equatable, Sendable {
         acceptedInputFormats: [AudioStreamFormat],
         outputAudioFormats: [AudioStreamFormat],
         supportsAutomaticSourceLanguage: Bool,
-        reportsDetectedSourceLanguage: Bool
+        reportsDetectedSourceLanguage: Bool,
+        requiredFeatures: Set<SpeechFeature> = [],
+        supportsExplicitSourceLanguage: Bool = true
     ) {
         self.requiresNetwork = requiresNetwork
         self.credentialRequirement = credentialRequirement
         self.supportedFeatures = supportedFeatures
+        self.requiredFeatures = requiredFeatures
         self.acceptedInputFormats = acceptedInputFormats
         self.outputAudioFormats = outputAudioFormats
         self.supportsAutomaticSourceLanguage = supportsAutomaticSourceLanguage
+        self.supportsExplicitSourceLanguage = supportsExplicitSourceLanguage
         self.reportsDetectedSourceLanguage = reportsDetectedSourceLanguage
     }
 
@@ -41,10 +48,15 @@ public struct SpeechProviderCapabilities: Equatable, Sendable {
         guard configuration.features.isSubset(of: supportedFeatures) else {
             return false
         }
-        if case .automatic = configuration.sourceLanguage {
-            return supportsAutomaticSourceLanguage
+        guard requiredFeatures.isSubset(of: configuration.features) else {
+            return false
         }
-        return true
+        switch configuration.sourceLanguage {
+        case .automatic:
+            return supportsAutomaticSourceLanguage
+        case .language:
+            return supportsExplicitSourceLanguage
+        }
     }
 
     public func accepts(inputFormat: AudioStreamFormat) -> Bool {

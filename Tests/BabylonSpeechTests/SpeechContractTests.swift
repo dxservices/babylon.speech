@@ -122,8 +122,104 @@ struct SpeechContractTests {
 
         #expect(!capabilities.supports(automatic))
         #expect(capabilities.supports(explicit))
+        #expect(capabilities.requiredFeatures.isEmpty)
+        #expect(capabilities.supportsExplicitSourceLanguage)
         #expect(!capabilities.requiresCredential)
         requireSendable(capabilities)
+    }
+
+    @Test("Capabilities can require translation and reject explicit source language")
+    func capabilitiesRefineFeatureAndSourceLanguageSupport() throws {
+        let inputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let capabilities = SpeechProviderCapabilities(
+            requiresNetwork: true,
+            credentialRequirement: .callerInjected,
+            supportedFeatures: [.transcription, .translation],
+            acceptedInputFormats: [inputFormat],
+            outputAudioFormats: [inputFormat],
+            supportsAutomaticSourceLanguage: true,
+            reportsDetectedSourceLanguage: false,
+            requiredFeatures: [.translation],
+            supportsExplicitSourceLanguage: false
+        )
+        let translation = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.translation],
+            sourceLanguage: .automatic,
+            targetLanguage: SpeechLanguageTag("fr")
+        )
+        let combined = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.transcription, .translation],
+            sourceLanguage: .automatic,
+            targetLanguage: SpeechLanguageTag("fr")
+        )
+        let transcription = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.transcription],
+            sourceLanguage: .automatic
+        )
+        let explicitSource = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.translation],
+            sourceLanguage: .language(SpeechLanguageTag("en")),
+            targetLanguage: SpeechLanguageTag("fr")
+        )
+        let combinedExplicitSource = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.transcription, .translation],
+            sourceLanguage: .language(SpeechLanguageTag("en")),
+            targetLanguage: SpeechLanguageTag("fr")
+        )
+        let transcriptionExplicitSource = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.transcription],
+            sourceLanguage: .language(SpeechLanguageTag("en"))
+        )
+
+        #expect(capabilities.supports(translation))
+        #expect(capabilities.supports(combined))
+        #expect(!capabilities.supports(transcription))
+        #expect(!capabilities.supports(explicitSource))
+        #expect(!capabilities.supports(combinedExplicitSource))
+        #expect(!capabilities.supports(transcriptionExplicitSource))
+        #expect(capabilities.requiredFeatures == [.translation])
+        #expect(!capabilities.supportsExplicitSourceLanguage)
+        requireSendable(capabilities)
+    }
+
+    @Test("Capabilities fail closed when required features are unsupported")
+    func inconsistentRequiredFeaturesFailClosed() throws {
+        let inputFormat = try AudioStreamFormat.monoPCM16(sampleRate: 16_000)
+        let capabilities = SpeechProviderCapabilities(
+            requiresNetwork: false,
+            credentialRequirement: .none,
+            supportedFeatures: [.transcription],
+            acceptedInputFormats: [inputFormat],
+            outputAudioFormats: [],
+            supportsAutomaticSourceLanguage: true,
+            reportsDetectedSourceLanguage: false,
+            requiredFeatures: [.translation]
+        )
+        let transcription = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.transcription],
+            sourceLanguage: .automatic
+        )
+        let translation = try SpeechSessionConfiguration(
+            sessionID: SpeechSessionID(audioFlowID: AudioFlowID()),
+            features: [.translation],
+            sourceLanguage: .automatic,
+            targetLanguage: SpeechLanguageTag("fr")
+        )
+
+        #expect(
+            !capabilities.requiredFeatures.isSubset(
+                of: capabilities.supportedFeatures
+            )
+        )
+        #expect(!capabilities.supports(transcription))
+        #expect(!capabilities.supports(translation))
     }
 }
 
