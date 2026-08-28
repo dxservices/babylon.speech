@@ -125,6 +125,9 @@ final class OpenAIRealtimeWebSocketTransport {
     var onEvent: (
         @MainActor @Sendable (OpenAIRealtimeDecodedEvent) -> Void
     )?
+    var onTerminal: (
+        @MainActor @Sendable (SpeechProviderFailure) -> Void
+    )?
 
     private let authorization: OpenAIRealtimeAuthorization
     private let wireCodec: OpenAIRealtimeWireCodec
@@ -149,6 +152,7 @@ final class OpenAIRealtimeWebSocketTransport {
     private var closeWaiterGeneration: UInt64 = 0
     private var audioEpochGeneration: UInt64 = 0
     private var uplinkAttemptGeneration: UInt64 = 0
+    private var terminalSignalGeneration: UInt64?
     private var activeGeneration: UInt64?
     private var pendingPingAttemptGeneration: UInt64?
     private var closeGeneration: UInt64?
@@ -846,6 +850,9 @@ final class OpenAIRealtimeWebSocketTransport {
         _ failure: SpeechProviderFailure,
         generation: UInt64
     ) {
+        let shouldSignalTerminal =
+            pendingPostUpdateValidationGeneration != generation
+            && closeGeneration != generation
         if closeGeneration == generation {
             finishGracefulClose(with: .failed, terminate: false)
         }
@@ -855,6 +862,9 @@ final class OpenAIRealtimeWebSocketTransport {
             terminateSocketPreservingGeneration(generation)
         } else {
             terminateConnection(generation: generation)
+        }
+        if shouldSignalTerminal {
+            signalTerminal(failure, generation: generation)
         }
     }
 
@@ -1190,6 +1200,15 @@ final class OpenAIRealtimeWebSocketTransport {
         isOpen = false
         isConnected = false
         isCancelled = true
+    }
+
+    private func signalTerminal(
+        _ failure: SpeechProviderFailure,
+        generation: UInt64
+    ) {
+        guard terminalSignalGeneration != generation else { return }
+        terminalSignalGeneration = generation
+        onTerminal?(failure)
     }
 
     private static func failure(

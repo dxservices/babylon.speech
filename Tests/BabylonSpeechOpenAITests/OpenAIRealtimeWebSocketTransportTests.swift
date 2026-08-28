@@ -124,6 +124,8 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             socket: socket,
             scheduler: scheduler
         )
+        var terminalFailures: [SpeechProviderFailure] = []
+        transport.onTerminal = { terminalFailures.append($0) }
         let task = Task { @MainActor in
             await connectFailure(transport)
         }
@@ -139,6 +141,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(failure.code?.value, "connection_timed_out")
         XCTAssertEqual(socket.cancelCallCount, 1)
         XCTAssertTrue(socket.sentTexts.isEmpty)
+        XCTAssertTrue(terminalFailures.isEmpty)
     }
 
     func testCloseBeforeOpenMapsToFixedNetworkFailureAndFirstSignalWins()
@@ -146,6 +149,8 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
     {
         let socket = FakeRealtimeWebSocketConnection()
         let transport = makeTransport(socket: socket)
+        var terminalFailures: [SpeechProviderFailure] = []
+        transport.onTerminal = { terminalFailures.append($0) }
         let task = Task { @MainActor in await connectFailure(transport) }
         await waitUntil { socket.resumeCallCount == 1 }
 
@@ -157,12 +162,15 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(failure.code?.value, "connection_closed")
         XCTAssertFalse(String(describing: failure).contains("private"))
         XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertTrue(terminalFailures.isEmpty)
         XCTAssertTrue(socket.sentTexts.isEmpty)
     }
 
     func testUpdateSendFailureMapsToFixedNetworkFailure() async {
         let socket = FakeRealtimeWebSocketConnection()
         let transport = makeTransport(socket: socket)
+        var terminalFailures: [SpeechProviderFailure] = []
+        transport.onTerminal = { terminalFailures.append($0) }
         let task = Task { @MainActor in await connectFailure(transport) }
         await waitUntil { socket.resumeCallCount == 1 }
         socket.emitOpen()
@@ -177,6 +185,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(failure.code?.value, "session_update_failed")
         XCTAssertFalse(String(describing: failure).contains("private"))
         XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertTrue(terminalFailures.isEmpty)
     }
 
     func testSuccessfulUpdateCompletionWinsOverImmediateClose()
@@ -218,6 +227,8 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             socket: socket,
             scheduler: scheduler
         )
+        var terminalFailures: [SpeechProviderFailure] = []
+        transport.onTerminal = { terminalFailures.append($0) }
         let task = Task { @MainActor in await connectFailure(transport) }
         await waitUntil {
             scheduler.hasActiveTask(after: .seconds(12))
@@ -233,6 +244,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(socket.cancelCallCount, 1)
         XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(12)))
         XCTAssertTrue(socket.sentTexts.isEmpty)
+        XCTAssertTrue(terminalFailures.isEmpty)
     }
 
     func testCallerCancellationWhileUpdateSendIsPendingResumesOnce()
@@ -475,6 +487,57 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             context.channels,
             error: .transportClosed
         )
+    }
+
+    func testTerminalSignalCarriesExactSafeFailureAndIsFirstWins()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        var signals: [String] = []
+        var terminalFailures: [SpeechProviderFailure] = []
+        context.transport.onEvent = { event in
+            if case .providerFailure = event {
+                signals.append("failure")
+            }
+        }
+        context.transport.onTerminal = { failure in
+            signals.append("terminal")
+            terminalFailures.append(failure)
+        }
+
+        context.socket.emitMessageFailure(
+            SensitiveTestError("private receive failure")
+        )
+        context.socket.emitClose(SensitiveTestError("late close"))
+
+        XCTAssertEqual(signals, ["failure", "terminal"])
+        XCTAssertEqual(terminalFailures.count, 1)
+        XCTAssertEqual(terminalFailures[0].classification, .network)
+        XCTAssertEqual(
+            terminalFailures[0].code?.value,
+            "connection_closed"
+        )
+        XCTAssertFalse(String(describing: terminalFailures).contains("private"))
+    }
+
+    func testNormalSessionClosedDoesNotSignalUnexpectedTerminalFailure()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        var signals: [String] = []
+        context.transport.onEvent = { event in
+            if event == .sessionClosed {
+                signals.append("closed")
+            }
+        }
+        context.transport.onTerminal = { _ in
+            signals.append("terminal")
+        }
+
+        context.socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        context.socket.emitClose(nil)
+
+        XCTAssertEqual(signals, ["closed"])
     }
 
     func testPingStartsOnlyAfterPostUpdateValidationCompletes()
