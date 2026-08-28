@@ -2,22 +2,20 @@
 
 BabylonSpeech is a provider-neutral real-time speech-intelligence Swift package built on BabylonAudio.
 
-The package is pre-0.1. Its provider-neutral session contracts are available, while the provider adapter products remain placeholders.
+The provider-neutral contracts and the OpenAI Realtime translation adapter are implemented. The Google product remains a reserved target for later work.
 
 ## Requirements
 
 - iOS 18 or later
 - Swift 6 language mode
 - Swift tools 6.0 or later
-- BabylonAudio from an exact release tag before publication
-
-During initial coordinated development, the manifest uses a sibling local-path dependency on `babylon.audio`. That dependency must be replaced with an exact remote tag before release.
+- BabylonAudio from `https://github.com/dxservices/babylon.audio.git`, pinned exactly to `0.1.0`
 
 ## Products
 
 - `BabylonSpeech`: provider-neutral speech session, configuration, event, capability, and failure contracts
-- `BabylonSpeechOpenAI`: OpenAI Realtime wire and transport adapter
-- `BabylonSpeechGoogle`: Google speech-provider adapter
+- `BabylonSpeechOpenAI`: OpenAI Realtime translation provider, wire codec, transport, and session-bound audio channels
+- `BabylonSpeechGoogle`: reserved Google adapter target
 
 Provider-specific dependencies must remain inside their corresponding product. The neutral product must not import provider SDKs or expose WebSocket, gRPC, base64, or provider event names.
 
@@ -34,6 +32,44 @@ It does not own:
 - Raw audio, transcript, credential, provider-payload, or full-error logging
 
 Provider adapters accept explicitly injected authorization material and report structured failures. The consuming application decides recovery.
+
+## OpenAI Realtime usage
+
+The application must inject an app-owned, short-lived Realtime client secret. Never pass a long-lived server API key into the package or ship one in a client application. BabylonSpeech does not acquire, refresh, persist, or log credentials. The application owns secret delivery, session recovery, and provider recreation.
+
+`OpenAIRealtimeSpeechProvider` uses automatic source-language detection and requires translation with a target language. Transcription is optional. Uplink and translated-audio downlink both use 24 kHz, mono, interleaved, signed PCM16 little-endian frames.
+
+```swift
+import BabylonAudio
+import BabylonSpeech
+import BabylonSpeechOpenAI
+
+let authorization = OpenAIRealtimeAuthorization(
+    clientSecret: shortLivedClientSecret
+)
+let provider = OpenAIRealtimeSpeechProvider(authorization: authorization)
+let configuration = try SpeechSessionConfiguration(
+    sessionID: SpeechSessionID(audioFlowID: audioFlowID),
+    features: [.translation, .transcription],
+    sourceLanguage: .automatic,
+    targetLanguage: SpeechLanguageTag("fr")
+)
+
+let channels = try await provider.startSession(configuration)
+let eventTask = Task {
+    for await event in channels.events {
+        // Consume provider-neutral text, failure, and lifecycle events.
+    }
+}
+
+try await channels.uplink.send(capturedPCM16Frame)
+
+// Stop from the owning application lifecycle when local work is complete.
+await provider.stopSession(configuration.sessionID)
+await eventTask.value
+```
+
+Omit `.transcription` for translation-only sessions. Always stop a session when the application is done with it; after a terminal failure, the application decides whether and when to create a new provider and session.
 
 ## Session channels
 
@@ -70,6 +106,8 @@ python3 Scripts/check_repository.py
 ```
 
 The repository check requires a non-shallow Git checkout and scans every commit reachable from local refs. CI must fetch full history.
+
+All repository tests use unit or fake transports. They do not inspect a credential, require a key, or make live OpenAI requests.
 
 ## License
 

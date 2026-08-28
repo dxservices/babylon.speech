@@ -2,12 +2,23 @@ import BabylonAudio
 import BabylonSpeech
 import Foundation
 
+/// An OpenAI Realtime provider for provider-neutral speech translation.
+///
+/// Sessions require translation and a target language, use automatic source
+/// language detection, and may additionally request transcription. Input and
+/// translated output audio use 24 kHz mono PCM16. The application owns
+/// authorization delivery, recovery policy, and provider recreation.
 @available(iOS 18, macOS 15, *)
 @MainActor
 public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     typealias TransportFactory = @MainActor @Sendable ()
         -> any OpenAIRealtimeSpeechSessionTransport
 
+    /// The fixed S2 OpenAI Realtime feature, authorization, and audio contract.
+    ///
+    /// The provider requires network access and caller-injected authorization,
+    /// requires translation, optionally supports transcription, accepts only
+    /// automatic source language, and uses 24 kHz mono PCM16 in both directions.
     public nonisolated let capabilities: SpeechProviderCapabilities
 
     private let transportFactory: TransportFactory
@@ -15,6 +26,13 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     private var endpoints: [AudioFlowID: OpenAIRealtimeSpeechSessionEndpoint]
         = [:]
 
+    /// Creates a provider with caller-injected Realtime authorization.
+    ///
+    /// This initializer does not connect or start a session. Create a new
+    /// provider when the application supplies replacement authorization.
+    ///
+    /// - Parameter authorization: An app-owned, short-lived Realtime client
+    ///   secret wrapper.
     public init(authorization: OpenAIRealtimeAuthorization) {
         capabilities = Self.makeCapabilities()
         initialSegmentRawValue = 0
@@ -34,6 +52,17 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
         self.initialSegmentRawValue = initialSegmentRawValue
     }
 
+    /// Starts an OpenAI Realtime translation session.
+    ///
+    /// The method returns channels after the WebSocket opens and the
+    /// `session.update` send completion succeeds. It does not wait for or imply
+    /// a separate server acknowledgement. Unsupported configurations and
+    /// connection failures fail closed with safe, structured identifiers.
+    ///
+    /// - Parameter configuration: A translation configuration with automatic
+    ///   source language and a target language. Transcription is optional.
+    /// - Returns: Session-bound events, PCM uplink, and translated-audio downlink.
+    /// - Throws: A safe ``SpeechProviderFailure``.
     public func startSession(
         _ configuration: SpeechSessionConfiguration
     ) async throws(SpeechProviderFailure) -> SpeechSessionChannels {
@@ -88,6 +117,12 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
         }
     }
 
+    /// Stops the current matching session and requests a graceful server close.
+    ///
+    /// Unknown or stale session identifiers have no effect. The application
+    /// remains responsible for any subsequent session or provider creation.
+    ///
+    /// - Parameter sessionID: The exact session identity to stop.
     public func stopSession(_ sessionID: SpeechSessionID) async {
         guard let endpoint = endpoints[sessionID.audioFlowID],
               endpoint.sessionID == sessionID
