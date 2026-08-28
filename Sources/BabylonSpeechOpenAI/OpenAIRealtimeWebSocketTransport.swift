@@ -69,7 +69,7 @@ enum OpenAIRealtimeCloseOutcome: Equatable, Sendable {
     case failed
 }
 
-@available(iOS 18, macOS 13, *)
+@available(iOS 18, macOS 15, *)
 @MainActor
 final class OpenAIRealtimeWebSocketTransport {
     typealias ConnectionFactory = @MainActor (URLRequest)
@@ -81,6 +81,34 @@ final class OpenAIRealtimeWebSocketTransport {
         @MainActor @Sendable (
             @escaping CloseWaiterCancellationAction
         ) async -> Void
+    typealias UplinkSendCancellationAction =
+        @MainActor @Sendable () -> Void
+    typealias UplinkSendCancellationHook =
+        @MainActor @Sendable (
+            @escaping UplinkSendCancellationAction
+        ) async -> Void
+
+    private struct AudioRequest {
+        let binding: OpenAIRealtimeAudioBinding
+        let includeDownlink: Bool
+    }
+
+    private struct AudioEpoch {
+        let binding: OpenAIRealtimeAudioBinding
+        let connectionGeneration: UInt64
+        let epochGeneration: UInt64
+        let channels: OpenAIRealtimeAudioChannels
+    }
+
+    private struct PendingUplink {
+        let connectionGeneration: UInt64
+        let epochGeneration: UInt64
+        let attemptGeneration: UInt64
+        let continuation: CheckedContinuation<
+            Result<Void, OpenAIRealtimeAudioChannelError>,
+            Never
+        >
+    }
 
     private struct CloseWaiter {
         let connectionGeneration: UInt64
@@ -104,6 +132,7 @@ final class OpenAIRealtimeWebSocketTransport {
     private let scheduler: any OpenAIRealtimeScheduler
     private let postUpdateValidationHook: PostUpdateValidationHook?
     private let closeWaiterCancellationHook: CloseWaiterCancellationHook?
+    private let uplinkSendCancellationHook: UplinkSendCancellationHook?
     private var connection: (any OpenAIRealtimeWebSocketConnection)?
     private var openContinuation:
         CheckedContinuation<Result<Void, SpeechProviderFailure>, Never>?
@@ -118,6 +147,8 @@ final class OpenAIRealtimeWebSocketTransport {
     private var pingAttemptGeneration: UInt64 = 0
     private var closeAttemptGeneration: UInt64 = 0
     private var closeWaiterGeneration: UInt64 = 0
+    private var audioEpochGeneration: UInt64 = 0
+    private var uplinkAttemptGeneration: UInt64 = 0
     private var activeGeneration: UInt64?
     private var pendingPingAttemptGeneration: UInt64?
     private var closeGeneration: UInt64?
@@ -125,6 +156,8 @@ final class OpenAIRealtimeWebSocketTransport {
     private var pendingPostUpdateValidationGeneration: UInt64?
     private var terminalAfterSuccessfulUpdateGeneration: UInt64?
     private var closeOutcome: OpenAIRealtimeCloseOutcome?
+    private var audioEpoch: AudioEpoch?
+    private var pendingUplink: PendingUplink?
     private var consecutivePongFailures = 0
     private var isOpen = false
     private var isConnected = false
@@ -137,7 +170,8 @@ final class OpenAIRealtimeWebSocketTransport {
         connectionFactory: ConnectionFactory? = nil,
         scheduler: (any OpenAIRealtimeScheduler)? = nil,
         postUpdateValidationHook: PostUpdateValidationHook? = nil,
-        closeWaiterCancellationHook: CloseWaiterCancellationHook? = nil
+        closeWaiterCancellationHook: CloseWaiterCancellationHook? = nil,
+        uplinkSendCancellationHook: UplinkSendCancellationHook? = nil
     ) {
         self.authorization = authorization
         self.wireCodec = wireCodec
@@ -147,36 +181,289 @@ final class OpenAIRealtimeWebSocketTransport {
         self.scheduler = scheduler ?? TaskRealtimeScheduler()
         self.postUpdateValidationHook = postUpdateValidationHook
         self.closeWaiterCancellationHook = closeWaiterCancellationHook
+        self.uplinkSendCancellationHook = uplinkSendCancellationHook
     }
 
     func connect(
         targetLanguage: String,
         transcriptionRequested: Bool
     ) async throws(SpeechProviderFailure) {
+        let result = await connectResult(
+            targetLanguage: targetLanguage,
+            transcriptionRequested: transcriptionRequested,
+            audioRequest: nil
+        )
+        switch result {
+        case .success:
+            return
+        case let .failure(failure):
+            throw failure
+        }
+    }
+
+    func connect(
+        targetLanguage: String,
+        transcriptionRequested: Bool,
+        audioBinding: OpenAIRealtimeAudioBinding,
+        includeDownlink: Bool
+    ) async throws(SpeechProviderFailure) -> OpenAIRealtimeAudioChannels {
+        let result = await connectResult(
+            targetLanguage: targetLanguage,
+            transcriptionRequested: transcriptionRequested,
+            audioRequest: AudioRequest(
+                binding: audioBinding,
+                includeDownlink: includeDownlink
+            )
+        )
+        switch result {
+        case let .success(channels):
+            guard let channels else {
+                preconditionFailure("Audio connect completed without channels")
+            }
+            return channels
+        case let .failure(failure):
+            throw failure
+        }
+    }
+
+    private func connectResult(
+        targetLanguage: String,
+        transcriptionRequested: Bool,
+        audioRequest: AudioRequest?
+    ) async -> Result<OpenAIRealtimeAudioChannels?, SpeechProviderFailure> {
         generation &+= 1
         let connectionGeneration = generation
-        let result: Result<Void, SpeechProviderFailure> =
-            await withTaskCancellationHandler {
-                guard !Task.isCancelled else {
-                    return .failure(Self.failure(
-                        classification: .network,
-                        type: "network_error",
-                        code: "connection_cancelled"
-                    ))
-                }
-                return await beginConnect(
-                    targetLanguage: targetLanguage,
-                    transcriptionRequested: transcriptionRequested,
+        return await withTaskCancellationHandler {
+            guard !Task.isCancelled else {
+                return .failure(Self.failure(
+                    classification: .network,
+                    type: "network_error",
+                    code: "connection_cancelled"
+                ))
+            }
+            return await beginConnect(
+                targetLanguage: targetLanguage,
+                transcriptionRequested: transcriptionRequested,
+                audioRequest: audioRequest,
+                generation: connectionGeneration
+            )
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.cancelForCaller(
                     generation: connectionGeneration
                 )
-            } onCancel: {
-                Task { @MainActor [weak self] in
-                    self?.cancelForCaller(
-                        generation: connectionGeneration
+            }
+        }
+    }
+
+    func sendPCM16(
+        binding: OpenAIRealtimeAudioBinding,
+        payload: Data
+    ) async throws(OpenAIRealtimeAudioChannelError) {
+        guard let audioEpoch else {
+            throw .transportClosed
+        }
+        try await sendPCM16(
+            binding: binding,
+            payload: payload,
+            connectionGeneration: audioEpoch.connectionGeneration,
+            epochGeneration: audioEpoch.epochGeneration
+        )
+    }
+
+    private func sendPCM16(
+        binding: OpenAIRealtimeAudioBinding,
+        payload: Data,
+        connectionGeneration: UInt64,
+        epochGeneration: UInt64
+    ) async throws(OpenAIRealtimeAudioChannelError) {
+        uplinkAttemptGeneration &+= 1
+        let attemptGeneration = uplinkAttemptGeneration
+        let result: Result<Void, OpenAIRealtimeAudioChannelError> =
+            await withTaskCancellationHandler {
+                guard !Task.isCancelled else {
+                    return .failure(.sendCancelled)
+                }
+                return await withCheckedContinuation { continuation in
+                    guard !Task.isCancelled else {
+                        continuation.resume(
+                            returning: .failure(.sendCancelled)
+                        )
+                        return
+                    }
+                    startUplink(
+                        binding: binding,
+                        payload: payload,
+                        connectionGeneration: connectionGeneration,
+                        epochGeneration: epochGeneration,
+                        attemptGeneration: attemptGeneration,
+                        continuation: continuation
                     )
                 }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let action: UplinkSendCancellationAction = {
+                        [weak self] in
+                        self?.finishUplink(
+                            with: .failure(.sendCancelled),
+                            connectionGeneration: connectionGeneration,
+                            epochGeneration: epochGeneration,
+                            attemptGeneration: attemptGeneration
+                        )
+                    }
+                    if let uplinkSendCancellationHook {
+                        await uplinkSendCancellationHook(action)
+                    } else {
+                        action()
+                    }
+                }
             }
-        try result.get()
+        switch result {
+        case .success:
+            return
+        case let .failure(error):
+            throw error
+        }
+    }
+
+    private func startUplink(
+        binding: OpenAIRealtimeAudioBinding,
+        payload: Data,
+        connectionGeneration: UInt64,
+        epochGeneration: UInt64,
+        attemptGeneration: UInt64,
+        continuation: CheckedContinuation<
+            Result<Void, OpenAIRealtimeAudioChannelError>,
+            Never
+        >
+    ) {
+        guard let audioEpoch else {
+            continuation.resume(returning: .failure(.transportClosed))
+            return
+        }
+        guard audioEpoch.binding == binding,
+              audioEpoch.connectionGeneration == connectionGeneration,
+              audioEpoch.epochGeneration == epochGeneration
+        else {
+            continuation.resume(returning: .failure(.staleFlow))
+            return
+        }
+        guard activeGeneration == connectionGeneration,
+              isOpen,
+              isConnected,
+              !isCancelled,
+              !isGracefulCloseDraining,
+              let connection
+        else {
+            continuation.resume(returning: .failure(.transportClosed))
+            return
+        }
+        guard !payload.isEmpty,
+              payload.count.isMultiple(of: MemoryLayout<Int16>.size)
+        else {
+            continuation.resume(
+                returning: .failure(.invalidPCM16Payload)
+            )
+            return
+        }
+        guard let event = wireCodec.appendAudioEvent(
+            pcm16Audio: payload
+        ) else {
+            continuation.resume(
+                returning: .failure(.invalidPCM16Payload)
+            )
+            return
+        }
+        guard pendingUplink == nil else {
+            continuation.resume(
+                returning: .failure(.uplinkRelayOverflow)
+            )
+            return
+        }
+
+        pendingUplink = PendingUplink(
+            connectionGeneration: connectionGeneration,
+            epochGeneration: epochGeneration,
+            attemptGeneration: attemptGeneration,
+            continuation: continuation
+        )
+        connection.send(text: event) { [weak self] error in
+            self?.finishUplink(
+                with: error == nil ? .success(()) : .failure(.sendFailed),
+                connectionGeneration: connectionGeneration,
+                epochGeneration: epochGeneration,
+                attemptGeneration: attemptGeneration
+            )
+        }
+    }
+
+    private func finishUplink(
+        with result: Result<Void, OpenAIRealtimeAudioChannelError>,
+        connectionGeneration: UInt64,
+        epochGeneration: UInt64,
+        attemptGeneration: UInt64
+    ) {
+        guard let pendingUplink,
+              pendingUplink.connectionGeneration == connectionGeneration,
+              pendingUplink.epochGeneration == epochGeneration,
+              pendingUplink.attemptGeneration == attemptGeneration
+        else { return }
+        self.pendingUplink = nil
+        pendingUplink.continuation.resume(returning: result)
+    }
+
+    private func installAudioEpoch(
+        request: AudioRequest,
+        connectionGeneration: UInt64
+    ) -> OpenAIRealtimeAudioChannels {
+        audioEpochGeneration &+= 1
+        let epochGeneration = audioEpochGeneration
+        let channels = OpenAIRealtimeAudioChannels(
+            binding: request.binding,
+            sendPCM16: { [weak self] binding, payload in
+                guard let self else {
+                    throw OpenAIRealtimeAudioChannelError.transportClosed
+                }
+                try await self.sendPCM16(
+                    binding: binding,
+                    payload: payload,
+                    connectionGeneration: connectionGeneration,
+                    epochGeneration: epochGeneration
+                )
+            },
+            includeReceiver: request.includeDownlink
+        )
+        audioEpoch = AudioEpoch(
+            binding: request.binding,
+            connectionGeneration: connectionGeneration,
+            epochGeneration: epochGeneration,
+            channels: channels
+        )
+        return channels
+    }
+
+    private func stopAudioUplink(
+        error: OpenAIRealtimeAudioChannelError
+    ) {
+        if let pendingUplink {
+            finishUplink(
+                with: .failure(error),
+                connectionGeneration: pendingUplink.connectionGeneration,
+                epochGeneration: pendingUplink.epochGeneration,
+                attemptGeneration: pendingUplink.attemptGeneration
+            )
+        }
+        audioEpoch?.channels.stopUplink(error: error)
+    }
+
+    private func finishAudioEpoch(
+        uplinkError: OpenAIRealtimeAudioChannelError,
+        downlinkError: OpenAIRealtimeAudioChannelError?
+    ) {
+        stopAudioUplink(error: uplinkError)
+        audioEpoch?.channels.finishDownlink(error: downlinkError)
+        audioEpoch = nil
     }
 
     @discardableResult
@@ -259,8 +546,9 @@ final class OpenAIRealtimeWebSocketTransport {
     private func beginConnect(
         targetLanguage: String,
         transcriptionRequested: Bool,
+        audioRequest: AudioRequest?,
         generation currentGeneration: UInt64
-    ) async -> Result<Void, SpeechProviderFailure> {
+    ) async -> Result<OpenAIRealtimeAudioChannels?, SpeechProviderFailure> {
         guard let endpoint = wireCodec.websocketEndpoint else {
             return .failure(Self.failure(
                 classification: .network,
@@ -279,6 +567,10 @@ final class OpenAIRealtimeWebSocketTransport {
             ))
         }
 
+        finishAudioEpoch(
+            uplinkError: .staleFlow,
+            downlinkError: .staleFlow
+        )
         cancelImmediately()
         resetCloseStateForNewConnection()
         activeGeneration = currentGeneration
@@ -313,9 +605,12 @@ final class OpenAIRealtimeWebSocketTransport {
                 }
                 connection.resume()
             }
-        guard case .success = openResult else {
+        switch openResult {
+        case .success:
+            break
+        case let .failure(failure):
             terminateConnection(generation: currentGeneration)
-            return openResult
+            return .failure(failure)
         }
         guard activeGeneration == currentGeneration,
               !isCancelled,
@@ -339,9 +634,12 @@ final class OpenAIRealtimeWebSocketTransport {
                     )
                 }
             }
-        guard case .success = updateResult else {
+        switch updateResult {
+        case .success:
+            break
+        case let .failure(failure):
             terminateConnection(generation: currentGeneration)
-            return updateResult
+            return .failure(failure)
         }
         if let postUpdateValidationHook {
             await postUpdateValidationHook()
@@ -366,7 +664,14 @@ final class OpenAIRealtimeWebSocketTransport {
             terminalAfterSuccessfulUpdateGeneration = nil
             activeGeneration = nil
             isCancelled = false
-            return .success(())
+            if audioRequest == nil {
+                return .success(nil)
+            }
+            return .failure(Self.failure(
+                classification: .network,
+                type: "network_error",
+                code: "connection_closed"
+            ))
         }
         guard !isCancelled,
               isOpen,
@@ -382,7 +687,13 @@ final class OpenAIRealtimeWebSocketTransport {
 
         pendingPostUpdateValidationGeneration = nil
         scheduleNextPing(generation: currentGeneration)
-        return .success(())
+        guard let audioRequest else {
+            return .success(nil)
+        }
+        return .success(installAudioEpoch(
+            request: audioRequest,
+            connectionGeneration: currentGeneration
+        ))
     }
 
     private func installCallbacks(
@@ -421,7 +732,23 @@ final class OpenAIRealtimeWebSocketTransport {
         switch result {
         case let .success(message):
             let event = wireCodec.decode(message)
-            onEvent?(event)
+            switch event {
+            case let .translatedAudio(payload):
+                if let audioEpoch,
+                   audioEpoch.connectionGeneration == generation
+                {
+                    let receiveResult = audioEpoch.channels.receiver?
+                        .receivePCM16(payload)
+                    if case let .failed(error) = receiveResult {
+                        finishAudioEpoch(
+                            uplinkError: error,
+                            downlinkError: error
+                        )
+                    }
+                }
+            default:
+                onEvent?(event)
+            }
             if event == .sessionClosed {
                 if closeGeneration == generation {
                     finishGracefulClose(
@@ -429,7 +756,10 @@ final class OpenAIRealtimeWebSocketTransport {
                         terminate: true
                     )
                 } else {
-                    terminateConnection(generation: generation)
+                    terminateConnection(
+                        generation: generation,
+                        downlinkError: nil
+                    )
                 }
                 return
             }
@@ -530,6 +860,10 @@ final class OpenAIRealtimeWebSocketTransport {
 
     private func terminateSocketPreservingGeneration(_ generation: UInt64) {
         guard activeGeneration == generation else { return }
+        finishAudioEpoch(
+            uplinkError: .transportClosed,
+            downlinkError: .transportClosed
+        )
         cancelPingTasks()
         if let connection {
             connection.onOpen = nil
@@ -695,6 +1029,7 @@ final class OpenAIRealtimeWebSocketTransport {
             closeGeneration = currentGeneration
             activeCloseAttemptGeneration = attemptGeneration
             isGracefulCloseDraining = true
+            stopAudioUplink(error: .transportClosed)
             cancelPingTasks()
             closeDrainTimeoutTask = scheduler.schedule(
                 after: Self.closeDrainTimeout
@@ -786,7 +1121,14 @@ final class OpenAIRealtimeWebSocketTransport {
         let waiters = Array(closeWaiters.values)
         closeWaiters.removeAll(keepingCapacity: false)
         if terminate {
-            terminateConnection()
+            let downlinkError: OpenAIRealtimeAudioChannelError? =
+                switch outcome {
+                case .serverAcknowledged, .localGraceful:
+                    nil
+                default:
+                    .transportClosed
+                }
+            terminateConnection(downlinkError: downlinkError)
         }
         for waiter in waiters {
             waiter.continuation.resume(returning: outcome)
@@ -821,8 +1163,15 @@ final class OpenAIRealtimeWebSocketTransport {
         continuation.resume(returning: result)
     }
 
-    private func terminateConnection(generation: UInt64? = nil) {
+    private func terminateConnection(
+        generation: UInt64? = nil,
+        downlinkError: OpenAIRealtimeAudioChannelError? = .transportClosed
+    ) {
         if let generation, activeGeneration != generation { return }
+        finishAudioEpoch(
+            uplinkError: .transportClosed,
+            downlinkError: downlinkError
+        )
         openTimeoutTask?.cancel()
         openTimeoutTask = nil
         cancelPingTasks()

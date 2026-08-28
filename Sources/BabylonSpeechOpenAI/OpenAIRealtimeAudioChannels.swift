@@ -13,7 +13,9 @@ enum OpenAIRealtimeAudioChannelError: Error, Equatable, Sendable {
     case invalidPCM16Payload
     case sequenceExhausted
     case downlinkRelayOverflow
+    case uplinkRelayOverflow
     case transportClosed
+    case sendCancelled
     case sendFailed
 }
 
@@ -462,7 +464,30 @@ struct OpenAIRealtimeAudioChannels: Sendable {
     @MainActor
     func invalidate(forReplacement replacement: OpenAIRealtimeAudioBinding) {
         guard replacement != binding else { return }
-        gate.invalidate(error: .staleFlow)
-        receiver?.finish(error: .staleFlow)
+        finish(
+            uplinkError: .staleFlow,
+            downlinkError: .staleFlow
+        )
+    }
+
+    @MainActor
+    func stopUplink(error: OpenAIRealtimeAudioChannelError) {
+        gate.invalidate(error: error)
+    }
+
+    @MainActor
+    func finishDownlink(
+        error: OpenAIRealtimeAudioChannelError? = nil
+    ) {
+        receiver?.finish(error: error)
+    }
+
+    @MainActor
+    func finish(
+        uplinkError: OpenAIRealtimeAudioChannelError,
+        downlinkError: OpenAIRealtimeAudioChannelError?
+    ) {
+        stopUplink(error: uplinkError)
+        finishDownlink(error: downlinkError)
     }
 }

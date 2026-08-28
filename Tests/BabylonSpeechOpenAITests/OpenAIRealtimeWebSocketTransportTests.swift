@@ -1,9 +1,10 @@
+import BabylonAudio
 import BabylonSpeech
 import Foundation
 import XCTest
 @testable import BabylonSpeechOpenAI
 
-@available(iOS 18, macOS 13, *)
+@available(iOS 18, macOS 15, *)
 @MainActor
 final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
     func testConnectBuildsAuthorizedTranslationRequestAndWaitsForUpdate()
@@ -453,11 +454,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
     func testReceiveFailureForwardsFixedNetworkFailureAndCancels()
         async throws
     {
-        let socket = FakeRealtimeWebSocketConnection()
-        let transport = makeTransport(socket: socket)
+        let context = try await makeConnectedAudio()
+        let socket = context.socket
+        let transport = context.transport
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
 
         socket.emitMessageFailure(
             SensitiveTestError("private receive failure")
@@ -470,6 +471,10 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(failure.code?.value, "connection_closed")
         XCTAssertFalse(String(describing: events).contains("private"))
         XCTAssertEqual(socket.cancelCallCount, 1)
+        await assertAudioStreamFinished(
+            context.channels,
+            error: .transportClosed
+        )
     }
 
     func testPingStartsOnlyAfterPostUpdateValidationCompletes()
@@ -568,9 +573,14 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             socket: socket,
             scheduler: scheduler
         )
+        let binding = makeAudioBinding()
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
 
         scheduler.advance(by: .seconds(15))
         scheduler.advance(by: .seconds(10))
@@ -589,6 +599,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(socket.cancelCallCount, 1)
         XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(10)))
         XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        await assertAudioStreamFinished(channels, error: .transportClosed)
 
         socket.completeNextPing(error: SensitiveTestError("late"))
         scheduler.advance(by: .seconds(10))
@@ -643,7 +654,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             socket: socket,
             scheduler: scheduler
         )
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
         let closeTask = Task { @MainActor in
             await transport.closeGracefully()
         }
@@ -660,6 +675,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertFalse(String(describing: closeOutcome).contains(
             "private"
         ))
+        await assertAudioStreamFinished(channels, error: .transportClosed)
     }
 
     func testGracefulCloseTimeoutIsForcedAndLateSignalsAreIgnored()
@@ -673,7 +689,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         )
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
         let closeTask = Task { @MainActor in
             await transport.closeGracefully()
         }
@@ -691,6 +711,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertTrue(events.isEmpty)
         XCTAssertEqual(socket.cancelCallCount, 1)
         XCTAssertEqual(closeOutcome, .localForcedAfterTimeout)
+        await assertAudioStreamFinished(channels, error: .transportClosed)
     }
 
     func testGracefulCloseTimesOutWhenSendCompletionNeverReturns()
@@ -735,7 +756,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         )
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
         let closeTask = Task { @MainActor in
             await transport.closeGracefully()
         }
@@ -747,6 +772,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(closeOutcome, .localGraceful)
         XCTAssertTrue(events.isEmpty)
         XCTAssertEqual(socket.cancelCallCount, 1)
+        await assertAudioStreamFinished(channels, error: nil)
         socket.completeNextSend(error: SensitiveTestError("late send"))
         scheduler.advance(by: .seconds(10))
         XCTAssertTrue(events.isEmpty)
@@ -794,7 +820,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         )
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
         let closeTask = Task { @MainActor in
             await transport.closeGracefully()
         }
@@ -814,6 +844,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(failure.code?.value, "connection_closed")
         XCTAssertFalse(String(describing: events).contains("private"))
         XCTAssertEqual(socket.cancelCallCount, 1)
+        await assertAudioStreamFinished(channels, error: .transportClosed)
 
         scheduler.advance(by: .seconds(10))
         socket.emitMessage(.string(#"{"type":"session.closed"}"#))
@@ -901,13 +932,18 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         )
         var events: [OpenAIRealtimeDecodedEvent] = []
         transport.onEvent = { events.append($0) }
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
 
         socket.emitMessage(.string(#"{"type":"session.closed"}"#))
 
         XCTAssertEqual(events, [.sessionClosed])
         XCTAssertEqual(socket.cancelCallCount, 1)
         XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
+        await assertAudioStreamFinished(channels, error: nil)
     }
 
     func testImmediateCancelIsIdempotentAndDetachesCallbacks() async throws {
@@ -918,7 +954,11 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             socket: socket,
             scheduler: scheduler
         )
-        try await finishConnect(transport, socket: socket)
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: makeAudioBinding()
+        )
         scheduler.advance(by: .seconds(15))
 
         transport.cancelImmediately()
@@ -932,6 +972,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertFalse(scheduler.hasActiveTask(after: .seconds(15)))
         socket.completeNextPing(error: SensitiveTestError("late ping"))
         XCTAssertEqual(socket.cancelCallCount, 1)
+        await assertAudioStreamFinished(channels, error: .transportClosed)
     }
 
     func testReplacementCancelsOutstandingPingAndIgnoresLatePong()
@@ -1038,6 +1079,630 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         XCTAssertEqual(newOutcome, .serverAcknowledged)
         XCTAssertEqual(secondSocket.cancelCallCount, 1)
         _ = newWaiter
+    }
+
+    func testAudioSendUsesBoundSessionAndWaitsForSocketCompletion()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let payload = Data([0x01, 0x02, 0x03, 0x04])
+        let completion = CompletionProbe()
+        XCTAssertEqual(context.channels.binding, binding)
+        XCTAssertNotNil(context.channels.receiver)
+
+        let task = Task { @MainActor in
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: payload
+            )
+            completion.complete()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        XCTAssertFalse(completion.isComplete)
+        let event = try jsonObject(socket.sentTexts[1])
+        XCTAssertEqual(
+            event["type"] as? String,
+            "session.input_audio_buffer.append"
+        )
+        XCTAssertEqual(
+            event["audio"] as? String,
+            payload.base64EncodedString()
+        )
+
+        socket.completeNextSend()
+        try await task.value
+        XCTAssertTrue(completion.isComplete)
+    }
+
+    func testAudioSendRejectsWrongBindingEmptyPayloadAndUnestablishedState()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let transport = makeTransport(socket: socket)
+        let binding = makeAudioBinding()
+        let wrongBinding = makeAudioBinding()
+        let connectTask = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "fr",
+                transcriptionRequested: true,
+                audioBinding: binding,
+                includeDownlink: true
+            )
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+
+        let unestablishedError = await audioSendError {
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x01, 0x02])
+            )
+        }
+        XCTAssertEqual(unestablishedError, .transportClosed)
+        connectTask.cancel()
+        _ = try? await connectTask.value
+
+        let established = try await makeConnectedAudio(binding: binding)
+        let wrongBindingError = await audioSendError {
+            try await established.transport.sendPCM16(
+                binding: wrongBinding,
+                payload: Data([0x01, 0x02])
+            )
+        }
+        XCTAssertEqual(wrongBindingError, .staleFlow)
+        let emptyPayloadError = await audioSendError {
+            try await established.transport.sendPCM16(
+                binding: binding,
+                payload: Data()
+            )
+        }
+        XCTAssertEqual(emptyPayloadError, .invalidPCM16Payload)
+        let oddPayloadError = await audioSendError {
+            try await established.transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x01])
+            )
+        }
+        XCTAssertEqual(oddPayloadError, .invalidPCM16Payload)
+        XCTAssertEqual(established.socket.sentTexts.count, 1)
+    }
+
+    func testAudioSendAllowsOnlyOneInFlightWithoutQueueing() async throws {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let first = Task { @MainActor in
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x01, 0x02])
+            )
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        let overlapError = await audioSendError {
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x03, 0x04])
+            )
+        }
+        XCTAssertEqual(overlapError, .uplinkRelayOverflow)
+        XCTAssertEqual(socket.sentTexts.count, 2)
+
+        socket.completeNextSend()
+        try await first.value
+    }
+
+    func testAudioSendCallerCancellationWinsAndLateCompletionCannotFinishNextSend()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let cancelled = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        cancelled.cancel()
+        let cancelledOutcome = await cancelled.value
+        XCTAssertEqual(cancelledOutcome, .sendCancelled)
+        XCTAssertEqual(socket.cancelCallCount, 0)
+
+        let nextCompletion = CompletionProbe()
+        let next = Task { @MainActor in
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x03, 0x04])
+            )
+            nextCompletion.complete()
+        }
+        await waitUntil { socket.sentTexts.count == 3 }
+        socket.completeNextSend()
+        await Task.yield()
+        XCTAssertFalse(nextCompletion.isComplete)
+
+        socket.completeNextSend()
+        try await next.value
+        XCTAssertTrue(nextCompletion.isComplete)
+    }
+
+    func testAudioSendCompletionWinsOverBlockedLateCancellation()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let cancellationGate = TestRealtimeCancellationGate()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in socket },
+            scheduler: TestRealtimeScheduler(),
+            uplinkSendCancellationHook: { action in
+                await cancellationGate.waitBeforeRunning(action)
+            }
+        )
+        let binding = makeAudioBinding()
+        _ = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let first = Task { @MainActor in
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x01, 0x02])
+            )
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        first.cancel()
+        await waitUntil { cancellationGate.isWaiting }
+
+        socket.completeNextSend()
+        try await first.value
+
+        let nextCompletion = CompletionProbe()
+        let next = Task { @MainActor in
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x03, 0x04])
+            )
+            nextCompletion.complete()
+        }
+        await waitUntil { socket.sentTexts.count == 3 }
+        cancellationGate.open()
+        await waitUntil { cancellationGate.didRunAction }
+        XCTAssertFalse(nextCompletion.isComplete)
+
+        socket.completeNextSend()
+        try await next.value
+        XCTAssertTrue(nextCompletion.isComplete)
+    }
+
+    func testAudioSendMapsSocketErrorToFixedFailureWithoutRetainingDetail()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let send = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        socket.completeNextSend(
+            error: SensitiveTestError("private uplink send detail")
+        )
+
+        let outcome = await send.value
+        XCTAssertEqual(outcome, .sendFailed)
+        XCTAssertFalse(String(describing: outcome).contains("private"))
+        XCTAssertEqual(socket.cancelCallCount, 0)
+    }
+
+    func testAudioConnectDoesNotInstallEpochAfterImmediateRemoteTerminal()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let gate = TestRealtimePostUpdateGate()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in socket },
+            scheduler: TestRealtimeScheduler(),
+            postUpdateValidationHook: { await gate.waitOnFirstCall() }
+        )
+        let binding = makeAudioBinding()
+        let connect = Task { @MainActor in
+            do {
+                _ = try await transport.connect(
+                    targetLanguage: "fr",
+                    transcriptionRequested: true,
+                    audioBinding: binding,
+                    includeDownlink: true
+                )
+                XCTFail("Expected audio connect failure")
+                return false
+            } catch {
+                return true
+            }
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+        socket.emitOpen()
+        await waitUntil { socket.sentTexts.count == 1 }
+        socket.completeNextSend()
+        await waitUntil { gate.isWaiting }
+
+        socket.emitClose(SensitiveTestError("private close"))
+        gate.open()
+
+        let didFail = await connect.value
+        XCTAssertTrue(didFail)
+        let sendError = await audioSendError {
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x01, 0x02])
+            )
+        }
+        XCTAssertEqual(sendError, .transportClosed)
+    }
+
+    func testImmediateCancelAndRemoteTerminalResumePendingAudioSend()
+        async throws
+    {
+        let first = try await makeConnectedAudio()
+        let firstSocket = first.socket
+        let firstTransport = first.transport
+        let firstBinding = first.binding
+        let cancelled = Task { @MainActor in
+            await audioSendError {
+                try await firstTransport.sendPCM16(
+                    binding: firstBinding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { firstSocket.sentTexts.count == 2 }
+
+        firstTransport.cancelImmediately()
+        let cancelledOutcome = await cancelled.value
+        XCTAssertEqual(cancelledOutcome, .transportClosed)
+        firstSocket.completeNextSend()
+        XCTAssertEqual(firstSocket.cancelCallCount, 1)
+
+        let second = try await makeConnectedAudio()
+        let secondSocket = second.socket
+        let secondTransport = second.transport
+        let secondBinding = second.binding
+        let terminal = Task { @MainActor in
+            await audioSendError {
+                try await secondTransport.sendPCM16(
+                    binding: secondBinding,
+                    payload: Data([0x03, 0x04])
+                )
+            }
+        }
+        await waitUntil { secondSocket.sentTexts.count == 2 }
+
+        secondSocket.emitClose(SensitiveTestError("private terminal"))
+        let terminalOutcome = await terminal.value
+        XCTAssertEqual(terminalOutcome, .transportClosed)
+        secondSocket.completeNextSend()
+        XCTAssertEqual(secondSocket.cancelCallCount, 1)
+    }
+
+    func testGracefulCloseResumesPendingAudioAndRejectsDrainSends()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let receiver = try XCTUnwrap(context.channels.receiver)
+        var iterator = receiver.frames(
+            for: binding.sessionID.audioFlowID
+        ).makeAsyncIterator()
+        let audio = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        let close = Task { @MainActor in await transport.closeGracefully() }
+        await waitUntil { socket.sentTexts.count == 3 }
+        let audioOutcome = await audio.value
+        XCTAssertEqual(audioOutcome, .transportClosed)
+        let drainError = await audioSendError {
+            try await transport.sendPCM16(
+                binding: binding,
+                payload: Data([0x03, 0x04])
+            )
+        }
+        XCTAssertEqual(drainError, .transportClosed)
+        XCTAssertEqual(socket.sentTexts.count, 3)
+
+        let finalPayload = Data([0x41, 0x42])
+        socket.emitMessage(audioMessage(finalPayload))
+        let finalFrame = try await iterator.next()
+        XCTAssertEqual(finalFrame?.payload, finalPayload)
+
+        socket.completeNextSend()
+        socket.completeNextSend()
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        let closeOutcome = await close.value
+        XCTAssertEqual(closeOutcome, .serverAcknowledged)
+        let terminal = try await iterator.next()
+        XCTAssertNil(terminal)
+    }
+
+    func testInvalidDownlinkTerminatesAudioPersistentlyButKeepsTextOpen()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let receiver = try XCTUnwrap(context.channels.receiver)
+        let activeProbe = AudioStreamProbe()
+        let activeTask = activeProbe.consume(receiver.frames(
+            for: context.binding.sessionID.audioFlowID
+        ))
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        context.transport.onEvent = { events.append($0) }
+
+        context.socket.emitMessage(audioMessage(Data([0x01])))
+        await waitUntil { activeProbe.isComplete }
+        guard activeProbe.isComplete else {
+            activeTask.cancel()
+            return
+        }
+        XCTAssertEqual(activeProbe.terminalError, .invalidPCM16Payload)
+
+        let lateProbe = AudioStreamProbe()
+        let lateTask = lateProbe.consume(receiver.frames(
+            for: context.binding.sessionID.audioFlowID
+        ))
+        await waitUntil { lateProbe.isComplete }
+        guard lateProbe.isComplete else {
+            lateTask.cancel()
+            return
+        }
+        XCTAssertEqual(lateProbe.terminalError, .invalidPCM16Payload)
+
+        context.socket.emitMessage(.string(
+            #"{"type":"session.output_transcript.delta","delta":"still open"}"#
+        ))
+        XCTAssertEqual(events, [.translatedTranscriptDelta("still open")])
+        XCTAssertEqual(context.socket.cancelCallCount, 0)
+        _ = activeTask
+        _ = lateTask
+    }
+
+    func testDownlinkOverflowDrainsFrameAndPersistsTerminalError()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let receiver = try XCTUnwrap(context.channels.receiver)
+        let stream = receiver.frames(
+            for: context.binding.sessionID.audioFlowID
+        )
+        let acceptedPayload = Data([0x11, 0x12])
+        context.socket.emitMessage(audioMessage(acceptedPayload))
+        context.socket.emitMessage(audioMessage(Data([0x13, 0x14])))
+
+        let activeProbe = AudioStreamProbe()
+        let activeTask = activeProbe.consume(stream)
+        await waitUntil { activeProbe.isComplete }
+        guard activeProbe.isComplete else {
+            activeTask.cancel()
+            return
+        }
+        XCTAssertEqual(activeProbe.frames.map(\.payload), [acceptedPayload])
+        XCTAssertEqual(activeProbe.terminalError, .downlinkRelayOverflow)
+
+        let lateProbe = AudioStreamProbe()
+        let lateTask = lateProbe.consume(receiver.frames(
+            for: context.binding.sessionID.audioFlowID
+        ))
+        await waitUntil { lateProbe.isComplete }
+        guard lateProbe.isComplete else {
+            lateTask.cancel()
+            return
+        }
+        XCTAssertEqual(lateProbe.terminalError, .downlinkRelayOverflow)
+        XCTAssertEqual(context.socket.cancelCallCount, 0)
+        _ = activeTask
+        _ = lateTask
+    }
+
+    func testSameBindingReplacementRejectsOldEpochAndIsolatesCallbacks()
+        async throws
+    {
+        let firstSocket = FakeRealtimeWebSocketConnection()
+        let secondSocket = FakeRealtimeWebSocketConnection()
+        let cancellationGate = TestRealtimeCancellationGate()
+        var sockets = [firstSocket, secondSocket]
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in sockets.removeFirst() },
+            scheduler: TestRealtimeScheduler(),
+            uplinkSendCancellationHook: { action in
+                await cancellationGate.waitBeforeRunning(action)
+            }
+        )
+        let binding = makeAudioBinding()
+        let frame = try makeAudioFrame(
+            binding: binding,
+            payload: Data([0x01, 0x02])
+        )
+        let oldChannels = try await finishConnect(
+            transport,
+            socket: firstSocket,
+            binding: binding
+        )
+        var oldIterator = try XCTUnwrap(oldChannels.receiver).frames(
+            for: binding.sessionID.audioFlowID
+        ).makeAsyncIterator()
+        let oldSend = Task { @MainActor in
+            await audioSendError {
+                try await oldChannels.sender.send(frame)
+            }
+        }
+        await waitUntil { firstSocket.sentTexts.count == 2 }
+        oldSend.cancel()
+        await waitUntil { cancellationGate.isWaiting }
+
+        let replacement = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "de",
+                transcriptionRequested: false,
+                audioBinding: binding,
+                includeDownlink: true
+            )
+        }
+        await waitUntil { secondSocket.resumeCallCount == 1 }
+        let oldSendOutcome = await oldSend.value
+        XCTAssertEqual(oldSendOutcome, .staleFlow)
+        do {
+            _ = try await oldIterator.next()
+            XCTFail("Expected replaced receiver to finish")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .staleFlow)
+        }
+        secondSocket.emitOpen()
+        await waitUntil { secondSocket.sentTexts.count == 1 }
+        secondSocket.completeNextSend()
+        let newChannels = try await replacement.value
+        firstSocket.emitMessage(audioMessage(Data([0x11, 0x12])))
+        XCTAssertEqual(
+            newChannels.receiver?.noSubscriberDiscardCount,
+            0
+        )
+        let staleSenderError = await audioSendError {
+            try await oldChannels.sender.send(frame)
+        }
+        XCTAssertEqual(staleSenderError, .staleFlow)
+
+        let newSend = Task { @MainActor in
+            try await newChannels.sender.send(frame)
+        }
+        await waitUntil { secondSocket.sentTexts.count == 2 }
+        cancellationGate.open()
+        await waitUntil { cancellationGate.didRunAction }
+        firstSocket.completeNextSend()
+        await Task.yield()
+        secondSocket.completeNextSend()
+        try await newSend.value
+    }
+
+    func testTranslatedAudioGoesOnlyToBoundReceiverAndNotEventCallback()
+        async throws
+    {
+        let context = try await makeConnectedAudio()
+        let (socket, transport, binding) = (
+            context.socket,
+            context.transport,
+            context.binding
+        )
+        let payload = Data([0x31, 0x32])
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        let receiver = try XCTUnwrap(context.channels.receiver)
+        var iterator = receiver.frames(
+            for: binding.sessionID.audioFlowID
+        ).makeAsyncIterator()
+
+        let messages: [(String, String, Data)] = [
+            ("session.output_audio.delta", "delta", payload),
+            ("response.output_audio.delta", "delta", Data([0x33, 0x34])),
+            ("response.audio.delta", "audio", Data([0x35, 0x36])),
+        ]
+        for (type, field, expectedPayload) in messages {
+            socket.emitMessage(audioMessage(
+                expectedPayload,
+                type: type,
+                field: field
+            ))
+            XCTAssertTrue(events.isEmpty)
+            let frame = try await iterator.next()
+            XCTAssertEqual(frame?.flowID, binding.sessionID.audioFlowID)
+            XCTAssertEqual(frame?.payload, expectedPayload)
+        }
+        XCTAssertEqual(socket.receiveCallCount, 4)
+
+        socket.emitMessage(.string(
+            #"{"type":"session.output_transcript.delta","delta":"bonjour"}"#
+        ))
+        XCTAssertEqual(events, [.translatedTranscriptDelta("bonjour")])
+
+        socket.emitClose(SensitiveTestError("private terminal"))
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected terminal receiver failure")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .transportClosed)
+        }
+    }
+
+    func testAudioIsDroppedBeforeValidationAndWhenDownlinkIsDisabled()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let gate = TestRealtimePostUpdateGate()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in socket },
+            scheduler: TestRealtimeScheduler(),
+            postUpdateValidationHook: { await gate.waitOnFirstCall() }
+        )
+        let binding = makeAudioBinding()
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        let connect = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "fr",
+                transcriptionRequested: true,
+                audioBinding: binding,
+                includeDownlink: false
+            )
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+        socket.emitOpen()
+        await waitUntil { socket.sentTexts.count == 1 }
+        socket.completeNextSend()
+        await waitUntil { gate.isWaiting }
+
+        socket.emitMessage(audioMessage(Data([0x41, 0x42])))
+        XCTAssertTrue(events.isEmpty)
+        gate.open()
+        let channels = try await connect.value
+        XCTAssertNil(channels.receiver)
+
+        socket.emitMessage(audioMessage(Data([0x43, 0x44])))
+        XCTAssertTrue(events.isEmpty)
     }
 
     func testURLSessionConnectionSatisfiesCompileAndSendableSeam() {
@@ -1167,6 +1832,122 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         await waitUntil { socket.sentTexts.count == 1 }
         socket.completeNextSend()
         try await task.value
+    }
+
+    private func finishConnect(
+        _ transport: OpenAIRealtimeWebSocketTransport,
+        socket: FakeRealtimeWebSocketConnection,
+        binding: OpenAIRealtimeAudioBinding
+    ) async throws -> OpenAIRealtimeAudioChannels {
+        let task = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "fr",
+                transcriptionRequested: true,
+                audioBinding: binding,
+                includeDownlink: true
+            )
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+        socket.emitOpen()
+        await waitUntil { socket.sentTexts.count == 1 }
+        socket.completeNextSend()
+        return try await task.value
+    }
+
+    private func makeConnectedAudio(
+        binding: OpenAIRealtimeAudioBinding? = nil
+    ) async throws -> (
+        socket: FakeRealtimeWebSocketConnection,
+        transport: OpenAIRealtimeWebSocketTransport,
+        binding: OpenAIRealtimeAudioBinding,
+        channels: OpenAIRealtimeAudioChannels
+    ) {
+        let socket = FakeRealtimeWebSocketConnection()
+        let transport = makeTransport(socket: socket)
+        let binding = binding ?? makeAudioBinding()
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        return (socket, transport, binding, channels)
+    }
+
+    private func makeAudioBinding() -> OpenAIRealtimeAudioBinding {
+        OpenAIRealtimeAudioBinding(
+            sessionID: SpeechSessionID(audioFlowID: .init())
+        )
+    }
+
+    private func audioMessage(
+        _ payload: Data,
+        type: String = "session.output_audio.delta",
+        field: String = "delta"
+    ) -> OpenAIRealtimeWebSocketMessage {
+        .string(
+            #"{"type":"\#(type)","\#(field)":"\#(payload.base64EncodedString())"}"#
+        )
+    }
+
+    private func makeAudioFrame(
+        binding: OpenAIRealtimeAudioBinding,
+        payload: Data
+    ) throws -> AudioFrame {
+        try AudioFrame(
+            flowID: binding.sessionID.audioFlowID,
+            sequence: 0,
+            timestamp: .zero,
+            format: .monoPCM16(sampleRate: 24_000),
+            payload: payload,
+            duration: try AudioStreamFormat
+                .monoPCM16(sampleRate: 24_000)
+                .duration(forPayloadByteCount: payload.count)
+        )
+    }
+
+    private func audioSendError(
+        _ operation: @escaping @MainActor () async throws -> Void
+    ) async -> OpenAIRealtimeAudioChannelError {
+        do {
+            try await operation()
+            XCTFail("Expected audio send failure")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            return error
+        } catch {
+            XCTFail("Expected safe audio channel failure")
+        }
+        return .sendFailed
+    }
+
+    private func assertAudioStreamFinished(
+        _ channels: OpenAIRealtimeAudioChannels,
+        error expectedError: OpenAIRealtimeAudioChannelError?,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        guard let receiver = channels.receiver else {
+            return XCTFail(
+                "Expected downlink receiver",
+                file: file,
+                line: line
+            )
+        }
+        let probe = AudioStreamProbe()
+        let task = probe.consume(receiver.frames(
+            for: channels.binding.sessionID.audioFlowID
+        ))
+        await waitUntil { probe.isComplete }
+        guard probe.isComplete else {
+            task.cancel()
+            return
+        }
+        XCTAssertEqual(
+            probe.terminalError,
+            expectedError,
+            file: file,
+            line: line
+        )
+        _ = task
     }
 
     private func connectFailure(
@@ -1406,6 +2187,31 @@ private final class CompletionProbe {
 
     func complete() {
         isComplete = true
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class AudioStreamProbe {
+    private(set) var frames: [AudioFrame] = []
+    private(set) var terminalError: OpenAIRealtimeAudioChannelError?
+    private(set) var isComplete = false
+
+    func consume(
+        _ stream: AsyncThrowingStream<AudioFrame, any Error>
+    ) -> Task<Void, Never> {
+        Task { @MainActor in
+            do {
+                for try await frame in stream {
+                    frames.append(frame)
+                }
+            } catch let error as OpenAIRealtimeAudioChannelError {
+                terminalError = error
+            } catch {
+                XCTFail("Expected fixed audio channel terminal error")
+            }
+            isComplete = true
+        }
     }
 }
 
