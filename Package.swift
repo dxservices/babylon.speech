@@ -22,7 +22,10 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(path: "../babylon.audio"),
+        .package(
+            url: "https://github.com/dxservices/babylon.audio.git",
+            exact: "0.1.0"
+        ),
     ],
     targets: [
         .target(

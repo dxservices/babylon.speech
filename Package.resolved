@@ -1,0 +1,15 @@
+{
+  "originHash" : "a39c8154df06a8d5777fdcbe1fc52f2af9336e26d26902fba27cfaf34de69917",
+  "pins" : [
+    {
+      "identity" : "babylon.audio",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/dxservices/babylon.audio.git",
+      "state" : {
+        "revision" : "c92efd666bc3172f23890b162a69864c66d963fd",
+        "version" : "0.1.0"
+      }
+    }
+  ],
+  "version" : 3
+}
