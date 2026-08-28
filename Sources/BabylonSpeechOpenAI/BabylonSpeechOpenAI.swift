@@ -1,2 +1,2 @@
-// OpenAI adapter implementation is added after the provider-neutral contracts are frozen.
-
+// Public provider and session integration are intentionally deferred beyond
+// the wire codec slice.
