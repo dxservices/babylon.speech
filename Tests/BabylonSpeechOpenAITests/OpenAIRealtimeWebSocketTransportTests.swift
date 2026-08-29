@@ -7,6 +7,553 @@ import XCTest
 @available(iOS 18, macOS 15, *)
 @MainActor
 final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
+    func testTransferObservationCountsOnlySuccessfulUplinkAndGracefulDrain()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let scheduler = TestRealtimeScheduler()
+        let recorder = TransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            scheduler: scheduler,
+            transferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let updateText = socket.sentTexts[0]
+
+        scheduler.advance(by: .seconds(15))
+        let successfulSend = Task { @MainActor in
+            try await channels.sender.send(
+                try makeAudioFrame(
+                    binding: binding,
+                    payload: Data([0x01, 0x02])
+                )
+            )
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let successfulAudioText = socket.sentTexts[1]
+        socket.completeNextSend()
+        try await successfulSend.value
+
+        let failedSend = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x03, 0x04])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 3 }
+        socket.completeNextSend(error: SensitiveTestError("private send"))
+        let failedOutcome = await failedSend.value
+        XCTAssertEqual(failedOutcome, .sendFailed)
+
+        let cancelledSend = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x05, 0x06])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 4 }
+        cancelledSend.cancel()
+        let cancelledOutcome = await cancelledSend.value
+        XCTAssertEqual(cancelledOutcome, .sendCancelled)
+        socket.completeNextSend()
+
+        let drainingSend = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x07, 0x08])
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 5 }
+        let drainingAudioText = socket.sentTexts[4]
+
+        transport.onEvent = nil
+        transport.onTerminal = nil
+        let retainedMessage = socket.onMessage
+        let firstClose = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        let secondClose = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 6 }
+        let closeText = socket.sentTexts[5]
+        let drainingOutcome = await drainingSend.value
+        XCTAssertEqual(drainingOutcome, .transportClosed)
+        socket.completeNextSend()
+        socket.completeNextSend()
+        let finalText = #"{"type":"future.final"}"#
+        let closedText = #"{"type":"session.closed"}"#
+        socket.emitMessage(.string(finalText))
+        socket.emitMessage(.string(closedText))
+
+        let firstCloseOutcome = await firstClose.value
+        let secondCloseOutcome = await secondClose.value
+        XCTAssertEqual(firstCloseOutcome, .serverAcknowledged)
+        XCTAssertEqual(secondCloseOutcome, .serverAcknowledged)
+        XCTAssertEqual(socket.sentTexts.count, 6)
+        XCTAssertEqual(
+            recorder.records.filter { $0.fact.direction == .uplink },
+            [
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes: Int64(updateText.utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes:
+                            Int64(successfulAudioText.utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes:
+                            Int64(drainingAudioText.utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes: Int64(closeText.utf8.count)
+                    )
+                ),
+            ]
+        )
+        XCTAssertEqual(
+            recorder.records.filter { $0.fact.direction == .downlink },
+            [finalText, closedText].map {
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        applicationPayloadBytes: Int64($0.utf8.count)
+                    )
+                )
+            }
+        )
+
+        let factCount = recorder.records.count
+        retainedMessage?(.success(.string(#"{"type":"late"}"#)))
+        XCTAssertEqual(recorder.records.count, factCount)
+    }
+
+    func testDownlinkObservationCountsEverySuccessfulMessageBeforeDecode()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let recorder = TransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        _ = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        let multibyteUTF8: [UInt8] = [
+            0x7B, 0x22, 0x74, 0x79, 0x70, 0x65, 0x22, 0x3A, 0x22,
+            0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x2E, 0x75, 0x74,
+            0x66, 0x38, 0x22, 0x2C, 0x22, 0x76, 0x61, 0x6C, 0x75,
+            0x65, 0x22, 0x3A, 0x22, 0xC3, 0xA9, 0x22, 0x7D,
+        ]
+        let multibyteText = String(decoding: multibyteUTF8, as: UTF8.self)
+        XCTAssertNotEqual(multibyteText.count, multibyteText.utf8.count)
+        XCTAssertEqual(multibyteText.utf8.count, 35)
+        let messages: [OpenAIRealtimeWebSocketMessage] = [
+            .string(
+                #"{"type":"session.input_transcript.delta","delta":"a"}"#
+            ),
+            .string(#"{"type":"future.event","value":"x"}"#),
+            .string(multibyteText),
+            .string(#"{"#),
+            .string(
+                #"{"type":"session.output_audio.delta","delta":"%%%"}"#
+            ),
+            .data(Data([0x00, 0x01, 0x02, 0x03])),
+            .string(
+                #"{"type":"session.output_audio.delta","delta":"AQI="}"#
+            ),
+            .string(#"{"type":"session.closed"}"#),
+        ]
+
+        for message in messages {
+            socket.emitMessage(message)
+        }
+
+        let downlinkRecords = recorder.records.filter {
+            $0.fact.direction == .downlink
+        }
+        XCTAssertEqual(
+            downlinkRecords,
+            messages.map {
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        applicationPayloadBytes: $0.applicationPayloadBytes
+                    )
+                )
+            }
+        )
+        guard downlinkRecords.indices.contains(2) else {
+            return XCTFail("Expected the multibyte text transfer fact")
+        }
+        XCTAssertEqual(
+            downlinkRecords[2].fact.applicationPayloadBytes,
+            35
+        )
+        XCTAssertTrue(events.contains(.sourceTranscriptDelta("a")))
+        XCTAssertTrue(events.contains(.sessionClosed))
+    }
+
+    func testTransferObservationRejectsFailuresImmediateAndLateCallbacks()
+        async throws
+    {
+        let failureSocket = FakeRealtimeWebSocketConnection()
+        let failureRecorder = TransferRecorder()
+        let failureBinding = makeAudioBinding()
+        let failureTransport = makeTransport(
+            socket: failureSocket,
+            transferObserver: { sessionID, fact in
+                failureRecorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        _ = try await finishConnect(
+            failureTransport,
+            socket: failureSocket,
+            binding: failureBinding
+        )
+        let failureBaseline = failureRecorder.records
+        failureSocket.emitMessageFailure(SensitiveTestError("private receive"))
+        XCTAssertEqual(failureRecorder.records, failureBaseline)
+
+        let immediateSocket = FakeRealtimeWebSocketConnection()
+        let immediateRecorder = TransferRecorder()
+        let immediateBinding = makeAudioBinding()
+        let immediateTransport = makeTransport(
+            socket: immediateSocket,
+            transferObserver: { sessionID, fact in
+                immediateRecorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        _ = try await finishConnect(
+            immediateTransport,
+            socket: immediateSocket,
+            binding: immediateBinding
+        )
+        let retainedMessage = immediateSocket.onMessage
+        let pendingSend = Task { @MainActor in
+            await audioSendError {
+                try await immediateTransport.sendPCM16(
+                    binding: immediateBinding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { immediateSocket.sentTexts.count == 2 }
+        immediateTransport.cancelImmediately()
+        let pendingOutcome = await pendingSend.value
+        XCTAssertEqual(pendingOutcome, .transportClosed)
+        let immediateBaseline = immediateRecorder.records
+
+        immediateSocket.completeNextSend()
+        retainedMessage?(.success(.string(#"{"type":"late"}"#)))
+        XCTAssertEqual(immediateRecorder.records, immediateBaseline)
+    }
+
+    func testTransferObserverReentrancyCannotReviveCancelledGeneration()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let recorder = TransferRecorder()
+        let action = TransferReentrantAction()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+                if fact.direction == .downlink {
+                    action.run()
+                }
+            }
+        )
+        _ = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        action.operation = { transport.cancelImmediately() }
+        var events: [OpenAIRealtimeDecodedEvent] = []
+        transport.onEvent = { events.append($0) }
+        let retainedMessage = socket.onMessage
+        let message = #"{"type":"session.input_transcript.delta","delta":"a"}"#
+
+        socket.emitMessage(.string(message))
+
+        XCTAssertTrue(events.isEmpty)
+        XCTAssertEqual(socket.cancelCallCount, 1)
+        XCTAssertEqual(
+            recorder.records.last,
+            TransferRecord(
+                sessionID: binding.sessionID,
+                fact: .init(
+                    direction: .downlink,
+                    applicationPayloadBytes: Int64(message.utf8.count)
+                )
+            )
+        )
+        let factCount = recorder.records.count
+        retainedMessage?(.success(.string(#"{"type":"late"}"#)))
+        XCTAssertEqual(recorder.records.count, factCount)
+    }
+
+    func testTransferObservationIsolatesSameSessionReplacementGeneration()
+        async throws
+    {
+        let firstSocket = FakeRealtimeWebSocketConnection()
+        let secondSocket = FakeRealtimeWebSocketConnection()
+        var sockets = [firstSocket, secondSocket]
+        let recorder = TransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in sockets.removeFirst() },
+            scheduler: TestRealtimeScheduler(),
+            transferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        _ = try await finishConnect(
+            transport,
+            socket: firstSocket,
+            binding: binding
+        )
+        let retainedOldMessage = firstSocket.onMessage
+        let oldSend = Task { @MainActor in
+            await audioSendError {
+                try await transport.sendPCM16(
+                    binding: binding,
+                    payload: Data([0x01, 0x02])
+                )
+            }
+        }
+        await waitUntil { firstSocket.sentTexts.count == 2 }
+
+        let replacement = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "de",
+                transcriptionRequested: false,
+                audioBinding: binding,
+                includeDownlink: true
+            )
+        }
+        await waitUntil { secondSocket.resumeCallCount == 1 }
+        let oldSendOutcome = await oldSend.value
+        XCTAssertEqual(oldSendOutcome, .staleFlow)
+        retainedOldMessage?(.success(.string(#"{"type":"old"}"#)))
+        firstSocket.completeNextSend()
+        secondSocket.emitOpen()
+        await waitUntil { secondSocket.sentTexts.count == 1 }
+        secondSocket.completeNextSend()
+        _ = try await replacement.value
+        retainedOldMessage?(.success(.string(#"{"type":"older"}"#)))
+        let currentText = #"{"type":"future.current"}"#
+        secondSocket.emitMessage(.string(currentText))
+
+        XCTAssertEqual(
+            recorder.records,
+            [
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes:
+                            Int64(firstSocket.sentTexts[0].utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes:
+                            Int64(secondSocket.sentTexts[0].utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        applicationPayloadBytes: Int64(currentText.utf8.count)
+                    )
+                ),
+            ]
+        )
+    }
+
+    func testGracefulOutcomeIsBarrierForLateTransferCallbacks()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let recorder = TransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        _ = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let retainedMessage = socket.onMessage
+        let close = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let closedText = #"{"type":"session.closed"}"#
+
+        socket.emitMessage(.string(closedText))
+        let outcome = await close.value
+
+        XCTAssertEqual(outcome, .serverAcknowledged)
+        XCTAssertEqual(
+            recorder.records.map(\.fact.direction),
+            [.uplink, .downlink]
+        )
+        let factsAtReturn = recorder.records
+        socket.completeNextSend()
+        retainedMessage?(.success(.string(#"{"type":"late"}"#)))
+        XCTAssertEqual(recorder.records, factsAtReturn)
+    }
+
+    func testSameSessionReuseRejectsRetainedOldTransportCallback()
+        async throws
+    {
+        let recorder = TransferRecorder()
+        let binding = makeAudioBinding()
+        let observer: OpenAIRealtimeTransferObserver = { sessionID, fact in
+            recorder.record(sessionID: sessionID, fact: fact)
+        }
+        let oldSocket = FakeRealtimeWebSocketConnection()
+        let oldTransport = makeTransport(
+            socket: oldSocket,
+            transferObserver: observer
+        )
+        _ = try await finishConnect(
+            oldTransport,
+            socket: oldSocket,
+            binding: binding
+        )
+        let retainedOldMessage = oldSocket.onMessage
+        oldTransport.cancelImmediately()
+
+        let newSocket = FakeRealtimeWebSocketConnection()
+        let newTransport = makeTransport(
+            socket: newSocket,
+            transferObserver: observer
+        )
+        _ = try await finishConnect(
+            newTransport,
+            socket: newSocket,
+            binding: binding
+        )
+        let factsBeforeCallbacks = recorder.records
+
+        retainedOldMessage?(.success(.string(#"{"type":"old"}"#)))
+        XCTAssertEqual(recorder.records, factsBeforeCallbacks)
+        let currentText = #"{"type":"current"}"#
+        newSocket.emitMessage(.string(currentText))
+        XCTAssertEqual(
+            recorder.records.last,
+            TransferRecord(
+                sessionID: binding.sessionID,
+                fact: .init(
+                    direction: .downlink,
+                    applicationPayloadBytes: Int64(currentText.utf8.count)
+                )
+            )
+        )
+    }
+
+    func testTransferObservationAttributesParallelFlowsIndependently()
+        async throws
+    {
+        let recorder = TransferRecorder()
+        let firstSocket = FakeRealtimeWebSocketConnection()
+        let secondSocket = FakeRealtimeWebSocketConnection()
+        let firstBinding = makeAudioBinding()
+        let secondBinding = makeAudioBinding()
+        let observer: OpenAIRealtimeTransferObserver = { sessionID, fact in
+            recorder.record(sessionID: sessionID, fact: fact)
+        }
+        let firstTransport = makeTransport(
+            socket: firstSocket,
+            transferObserver: observer
+        )
+        let secondTransport = makeTransport(
+            socket: secondSocket,
+            transferObserver: observer
+        )
+
+        _ = try await finishConnect(
+            firstTransport,
+            socket: firstSocket,
+            binding: firstBinding
+        )
+        _ = try await finishConnect(
+            secondTransport,
+            socket: secondSocket,
+            binding: secondBinding
+        )
+        let firstText = #"{"type":"first.flow"}"#
+        let secondText = #"{"type":"second.flow"}"#
+        firstSocket.emitMessage(.string(firstText))
+        secondSocket.emitMessage(.string(secondText))
+
+        XCTAssertEqual(
+            recorder.records.map(\.sessionID),
+            [
+                firstBinding.sessionID,
+                secondBinding.sessionID,
+                firstBinding.sessionID,
+                secondBinding.sessionID,
+            ]
+        )
+        XCTAssertEqual(
+            recorder.records.map(\.fact.direction),
+            [.uplink, .uplink, .downlink, .downlink]
+        )
+    }
+
     func testConnectBuildsAuthorizedTranslationRequestAndWaitsForUpdate()
         async throws
     {
@@ -1871,12 +2418,14 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
 
     private func makeTransport(
         socket: FakeRealtimeWebSocketConnection,
-        scheduler: TestRealtimeScheduler = TestRealtimeScheduler()
+        scheduler: TestRealtimeScheduler = TestRealtimeScheduler(),
+        transferObserver: OpenAIRealtimeTransferObserver? = nil
     ) -> OpenAIRealtimeWebSocketTransport {
         OpenAIRealtimeWebSocketTransport(
             authorization: .init(clientSecret: "test-client-secret"),
             connectionFactory: { _ in socket },
-            scheduler: scheduler
+            scheduler: scheduler,
+            transferObserver: transferObserver
         )
     }
 
@@ -2050,6 +2599,47 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             await Task.yield()
         }
         XCTAssertTrue(condition())
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+private struct TransferRecord: Equatable {
+    let sessionID: SpeechSessionID
+    let fact: OpenAIRealtimeTransferFact
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class TransferRecorder {
+    private(set) var records: [TransferRecord] = []
+
+    func record(
+        sessionID: SpeechSessionID,
+        fact: OpenAIRealtimeTransferFact
+    ) {
+        records.append(TransferRecord(sessionID: sessionID, fact: fact))
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class TransferReentrantAction {
+    var operation: (@MainActor () -> Void)?
+
+    func run() {
+        operation?()
+    }
+}
+
+@available(iOS 18, macOS 13, *)
+private extension OpenAIRealtimeWebSocketMessage {
+    var applicationPayloadBytes: Int64 {
+        switch self {
+        case let .string(text):
+            Int64(text.utf8.count)
+        case let .data(data):
+            Int64(data.count)
+        }
     }
 }
 

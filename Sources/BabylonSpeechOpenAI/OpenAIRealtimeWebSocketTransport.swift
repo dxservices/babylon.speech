@@ -100,6 +100,11 @@ final class OpenAIRealtimeWebSocketTransport {
         let channels: OpenAIRealtimeAudioChannels
     }
 
+    private struct TransferEpoch {
+        let sessionID: SpeechSessionID
+        let connectionGeneration: UInt64
+    }
+
     private struct PendingUplink {
         let connectionGeneration: UInt64
         let epochGeneration: UInt64
@@ -108,6 +113,13 @@ final class OpenAIRealtimeWebSocketTransport {
             Result<Void, OpenAIRealtimeAudioChannelError>,
             Never
         >
+    }
+
+    private struct PendingUplinkTransfer {
+        let connectionGeneration: UInt64
+        let epochGeneration: UInt64
+        let attemptGeneration: UInt64
+        let applicationPayloadBytes: Int64
     }
 
     private struct CloseWaiter {
@@ -136,6 +148,7 @@ final class OpenAIRealtimeWebSocketTransport {
     private let postUpdateValidationHook: PostUpdateValidationHook?
     private let closeWaiterCancellationHook: CloseWaiterCancellationHook?
     private let uplinkSendCancellationHook: UplinkSendCancellationHook?
+    private let transferObserver: OpenAIRealtimeTransferObserver?
     private var connection: (any OpenAIRealtimeWebSocketConnection)?
     private var openContinuation:
         CheckedContinuation<Result<Void, SpeechProviderFailure>, Never>?
@@ -161,7 +174,9 @@ final class OpenAIRealtimeWebSocketTransport {
     private var terminalAfterSuccessfulUpdateGeneration: UInt64?
     private var closeOutcome: OpenAIRealtimeCloseOutcome?
     private var audioEpoch: AudioEpoch?
+    private var transferEpoch: TransferEpoch?
     private var pendingUplink: PendingUplink?
+    private var pendingUplinkTransfer: PendingUplinkTransfer?
     private var consecutivePongFailures = 0
     private var isOpen = false
     private var isConnected = false
@@ -175,7 +190,8 @@ final class OpenAIRealtimeWebSocketTransport {
         scheduler: (any OpenAIRealtimeScheduler)? = nil,
         postUpdateValidationHook: PostUpdateValidationHook? = nil,
         closeWaiterCancellationHook: CloseWaiterCancellationHook? = nil,
-        uplinkSendCancellationHook: UplinkSendCancellationHook? = nil
+        uplinkSendCancellationHook: UplinkSendCancellationHook? = nil,
+        transferObserver: OpenAIRealtimeTransferObserver? = nil
     ) {
         self.authorization = authorization
         self.wireCodec = wireCodec
@@ -186,6 +202,7 @@ final class OpenAIRealtimeWebSocketTransport {
         self.postUpdateValidationHook = postUpdateValidationHook
         self.closeWaiterCancellationHook = closeWaiterCancellationHook
         self.uplinkSendCancellationHook = uplinkSendCancellationHook
+        self.transferObserver = transferObserver
     }
 
     func connect(
@@ -313,7 +330,8 @@ final class OpenAIRealtimeWebSocketTransport {
                             with: .failure(.sendCancelled),
                             connectionGeneration: connectionGeneration,
                             epochGeneration: epochGeneration,
-                            attemptGeneration: attemptGeneration
+                            attemptGeneration: attemptGeneration,
+                            invalidateTransfer: true
                         )
                     }
                     if let uplinkSendCancellationHook {
@@ -392,9 +410,15 @@ final class OpenAIRealtimeWebSocketTransport {
             attemptGeneration: attemptGeneration,
             continuation: continuation
         )
+        pendingUplinkTransfer = PendingUplinkTransfer(
+            connectionGeneration: connectionGeneration,
+            epochGeneration: epochGeneration,
+            attemptGeneration: attemptGeneration,
+            applicationPayloadBytes: Int64(event.utf8.count)
+        )
         connection.send(text: event) { [weak self] error in
-            self?.finishUplink(
-                with: error == nil ? .success(()) : .failure(.sendFailed),
+            self?.uplinkSendCompleted(
+                succeeded: error == nil,
                 connectionGeneration: connectionGeneration,
                 epochGeneration: epochGeneration,
                 attemptGeneration: attemptGeneration
@@ -406,8 +430,17 @@ final class OpenAIRealtimeWebSocketTransport {
         with result: Result<Void, OpenAIRealtimeAudioChannelError>,
         connectionGeneration: UInt64,
         epochGeneration: UInt64,
-        attemptGeneration: UInt64
+        attemptGeneration: UInt64,
+        invalidateTransfer: Bool = false
     ) {
+        if invalidateTransfer,
+           pendingUplinkTransfer?.connectionGeneration
+            == connectionGeneration,
+           pendingUplinkTransfer?.epochGeneration == epochGeneration,
+           pendingUplinkTransfer?.attemptGeneration == attemptGeneration
+        {
+            pendingUplinkTransfer = nil
+        }
         guard let pendingUplink,
               pendingUplink.connectionGeneration == connectionGeneration,
               pendingUplink.epochGeneration == epochGeneration,
@@ -415,6 +448,41 @@ final class OpenAIRealtimeWebSocketTransport {
         else { return }
         self.pendingUplink = nil
         pendingUplink.continuation.resume(returning: result)
+    }
+
+    private func uplinkSendCompleted(
+        succeeded: Bool,
+        connectionGeneration: UInt64,
+        epochGeneration: UInt64,
+        attemptGeneration: UInt64
+    ) {
+        guard let transfer = pendingUplinkTransfer,
+              transfer.connectionGeneration == connectionGeneration,
+              transfer.epochGeneration == epochGeneration,
+              transfer.attemptGeneration == attemptGeneration
+        else { return }
+        pendingUplinkTransfer = nil
+
+        guard succeeded else {
+            finishUplink(
+                with: .failure(.sendFailed),
+                connectionGeneration: connectionGeneration,
+                epochGeneration: epochGeneration,
+                attemptGeneration: attemptGeneration
+            )
+            return
+        }
+        guard reportTransferIfCurrent(
+            direction: .uplink,
+            applicationPayloadBytes: transfer.applicationPayloadBytes,
+            generation: connectionGeneration
+        ) else { return }
+        finishUplink(
+            with: .success(()),
+            connectionGeneration: connectionGeneration,
+            epochGeneration: epochGeneration,
+            attemptGeneration: attemptGeneration
+        )
     }
 
     private func installAudioEpoch(
@@ -448,8 +516,12 @@ final class OpenAIRealtimeWebSocketTransport {
     }
 
     private func stopAudioUplink(
-        error: OpenAIRealtimeAudioChannelError
+        error: OpenAIRealtimeAudioChannelError,
+        retainsPendingTransfer: Bool = false
     ) {
+        if !retainsPendingTransfer {
+            pendingUplinkTransfer = nil
+        }
         if let pendingUplink {
             finishUplink(
                 with: .failure(error),
@@ -591,6 +663,12 @@ final class OpenAIRealtimeWebSocketTransport {
                 code: "invalid_client_secret"
             ))
         }
+        transferEpoch = audioRequest.map {
+            TransferEpoch(
+                sessionID: $0.binding.sessionID,
+                connectionGeneration: currentGeneration
+            )
+        }
 
         let connection = connectionFactory(request)
         self.connection = connection
@@ -634,7 +712,9 @@ final class OpenAIRealtimeWebSocketTransport {
                 connection.send(text: updateEvent) { [weak self] error in
                     self?.updateSendCompleted(
                         error: error,
-                        generation: currentGeneration
+                        generation: currentGeneration,
+                        applicationPayloadBytes:
+                            Int64(updateEvent.utf8.count)
                     )
                 }
             }
@@ -667,6 +747,7 @@ final class OpenAIRealtimeWebSocketTransport {
             pendingPostUpdateValidationGeneration = nil
             terminalAfterSuccessfulUpdateGeneration = nil
             activeGeneration = nil
+            transferEpoch = nil
             isCancelled = false
             if audioRequest == nil {
                 return .success(nil)
@@ -735,6 +816,12 @@ final class OpenAIRealtimeWebSocketTransport {
 
         switch result {
         case let .success(message):
+            guard reportTransferIfCurrent(
+                direction: .downlink,
+                applicationPayloadBytes:
+                    Self.applicationPayloadBytes(for: message),
+                generation: generation
+            ) else { return }
             let event = wireCodec.decode(message)
             switch event {
             case let .translatedAudio(payload):
@@ -818,13 +905,19 @@ final class OpenAIRealtimeWebSocketTransport {
 
     private func updateSendCompleted(
         error: (any Error)?,
-        generation: UInt64
+        generation: UInt64,
+        applicationPayloadBytes: Int64
     ) {
         guard activeGeneration == generation,
               !isCancelled,
               updateContinuation != nil
         else { return }
         if error == nil {
+            guard reportTransferIfCurrent(
+                direction: .uplink,
+                applicationPayloadBytes: applicationPayloadBytes,
+                generation: generation
+            ) else { return }
             isConnected = true
             pendingPostUpdateValidationGeneration = generation
             finishUpdate(with: .success(()))
@@ -875,6 +968,8 @@ final class OpenAIRealtimeWebSocketTransport {
             downlinkError: .transportClosed
         )
         cancelPingTasks()
+        transferEpoch = nil
+        pendingUplinkTransfer = nil
         if let connection {
             connection.onOpen = nil
             connection.onMessage = nil
@@ -1039,7 +1134,10 @@ final class OpenAIRealtimeWebSocketTransport {
             closeGeneration = currentGeneration
             activeCloseAttemptGeneration = attemptGeneration
             isGracefulCloseDraining = true
-            stopAudioUplink(error: .transportClosed)
+            stopAudioUplink(
+                error: .transportClosed,
+                retainsPendingTransfer: true
+            )
             cancelPingTasks()
             closeDrainTimeoutTask = scheduler.schedule(
                 after: Self.closeDrainTimeout
@@ -1071,7 +1169,9 @@ final class OpenAIRealtimeWebSocketTransport {
                 [weak self] error in
                 self?.gracefulCloseSendCompleted(
                     succeeded: error == nil,
-                    generation: currentGeneration
+                    generation: currentGeneration,
+                    applicationPayloadBytes:
+                        Int64(closeEventToSend.utf8.count)
                 )
             }
         }
@@ -1079,7 +1179,8 @@ final class OpenAIRealtimeWebSocketTransport {
 
     private func gracefulCloseSendCompleted(
         succeeded: Bool,
-        generation: UInt64
+        generation: UInt64,
+        applicationPayloadBytes: Int64
     ) {
         guard closeOutcome == nil,
               closeGeneration == generation,
@@ -1089,6 +1190,11 @@ final class OpenAIRealtimeWebSocketTransport {
             finishGracefulClose(with: .failed, terminate: true)
             return
         }
+        _ = reportTransferIfCurrent(
+            direction: .uplink,
+            applicationPayloadBytes: applicationPayloadBytes,
+            generation: generation
+        )
     }
 
     private func gracefulCloseTimedOut(generation: UInt64) {
@@ -1128,6 +1234,8 @@ final class OpenAIRealtimeWebSocketTransport {
         closeGeneration = nil
         activeCloseAttemptGeneration = nil
         isGracefulCloseDraining = false
+        transferEpoch = nil
+        pendingUplinkTransfer = nil
         let waiters = Array(closeWaiters.values)
         closeWaiters.removeAll(keepingCapacity: false)
         if terminate {
@@ -1187,19 +1295,66 @@ final class OpenAIRealtimeWebSocketTransport {
         cancelPingTasks()
         closeDrainTimeoutTask?.cancel()
         closeDrainTimeoutTask = nil
-        if let connection {
-            connection.onOpen = nil
-            connection.onMessage = nil
-            connection.onClose = nil
-            connection.cancel()
-        }
+        let connectionToCancel = connection
         connection = nil
         activeGeneration = nil
+        transferEpoch = nil
+        pendingUplinkTransfer = nil
         pendingPostUpdateValidationGeneration = nil
         terminalAfterSuccessfulUpdateGeneration = nil
         isOpen = false
         isConnected = false
         isCancelled = true
+        connectionToCancel?.onOpen = nil
+        connectionToCancel?.onMessage = nil
+        connectionToCancel?.onClose = nil
+        connectionToCancel?.cancel()
+    }
+
+    @discardableResult
+    private func reportTransferIfCurrent(
+        direction: OpenAIRealtimeTransferDirection,
+        applicationPayloadBytes: Int64,
+        generation: UInt64
+    ) -> Bool {
+        guard activeGeneration == generation,
+              !isCancelled
+        else { return false }
+        let observedEpoch = transferEpoch
+        if let observedEpoch,
+           observedEpoch.connectionGeneration == generation,
+           let transferObserver
+        {
+            transferObserver(
+                observedEpoch.sessionID,
+                OpenAIRealtimeTransferFact(
+                    direction: direction,
+                    applicationPayloadBytes: applicationPayloadBytes
+                )
+            )
+        }
+        guard activeGeneration == generation,
+              !isCancelled
+        else { return false }
+        if let observedEpoch {
+            guard let currentEpoch = transferEpoch,
+                  currentEpoch.connectionGeneration
+                    == observedEpoch.connectionGeneration,
+                  currentEpoch.sessionID == observedEpoch.sessionID
+            else { return false }
+        }
+        return true
+    }
+
+    private nonisolated static func applicationPayloadBytes(
+        for message: OpenAIRealtimeWebSocketMessage
+    ) -> Int64 {
+        switch message {
+        case let .string(text):
+            Int64(text.utf8.count)
+        case let .data(data):
+            Int64(data.count)
+        }
     }
 
     private func signalTerminal(

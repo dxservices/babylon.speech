@@ -33,14 +33,23 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     /// This initializer does not connect or start a session. Create a new
     /// provider when the application supplies replacement authorization.
     ///
-    /// - Parameter authorization: An app-owned, short-lived Realtime client
-    ///   secret wrapper.
-    public init(authorization: OpenAIRealtimeAuthorization) {
+    /// - Parameters:
+    ///   - authorization: An app-owned, short-lived Realtime client secret
+    ///     wrapper.
+    ///   - transferObserver: An optional synchronous observer for content-free
+    ///     application-payload byte facts.
+    public init(
+        authorization: OpenAIRealtimeAuthorization,
+        transferObserver: OpenAIRealtimeTransferObserver? = nil
+    ) {
         capabilities = Self.makeCapabilities()
         initialSegmentRawValue = 0
         postStopResultHook = nil
         transportFactory = {
-            OpenAIRealtimeWebSocketTransport(authorization: authorization)
+            OpenAIRealtimeWebSocketTransport(
+                authorization: authorization,
+                transferObserver: transferObserver
+            )
         }
     }
 

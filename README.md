@@ -47,7 +47,14 @@ import BabylonSpeechOpenAI
 let authorization = OpenAIRealtimeAuthorization(
     clientSecret: shortLivedClientSecret
 )
-let provider = OpenAIRealtimeSpeechProvider(authorization: authorization)
+let provider = OpenAIRealtimeSpeechProvider(
+    authorization: authorization,
+    transferObserver: { sessionID, fact in
+        // Aggregate content-free application-payload bytes in app state.
+        // Network-interface attribution also remains an app responsibility.
+        recordTransfer(sessionID, fact.direction, fact.applicationPayloadBytes)
+    }
+)
 let configuration = try SpeechSessionConfiguration(
     sessionID: SpeechSessionID(audioFlowID: audioFlowID),
     features: [.translation, .transcription],
@@ -85,6 +92,19 @@ Immediate stop fails pending uplink work and closes downlink with an error.
 Graceful stop stops uplink first and permits bounded provider output drain;
 only a graceful outcome finishes downlink with normal end-of-stream. Stop
 cleanup is shielded from cancellation of the calling task.
+
+The optional OpenAI-specific transfer observer runs synchronously on the main
+actor and never receives message content. Uplink facts cover successful
+`session.update`, audio-append, and `session.close` text sends. Downlink facts
+cover every successfully received text or data message before decoding,
+including unknown or malformed messages. Authorization headers, pings, failed
+socket completions, explicitly caller-cancelled sends, receive failures, and
+callbacks from stale sessions do not produce facts. An audio append whose
+socket completion succeeds during graceful drain is still observed even after
+its channel caller has been released. A completed close outcome is a
+transfer-observation barrier. The package does not buffer observations or
+attribute them to a network; aggregation and network attribution remain
+application responsibilities.
 
 ## Session channels
 
