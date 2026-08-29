@@ -38,9 +38,12 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     ///     wrapper.
     ///   - transferObserver: An optional synchronous observer for content-free
     ///     application-payload byte facts.
+    ///   - audioTransferObserver: An optional synchronous observer for
+    ///     content-free audio media-duration facts.
     public init(
         authorization: OpenAIRealtimeAuthorization,
-        transferObserver: OpenAIRealtimeTransferObserver? = nil
+        transferObserver: OpenAIRealtimeTransferObserver? = nil,
+        audioTransferObserver: OpenAIRealtimeAudioTransferObserver? = nil
     ) {
         capabilities = Self.makeCapabilities()
         initialSegmentRawValue = 0
@@ -48,7 +51,8 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
         transportFactory = {
             OpenAIRealtimeWebSocketTransport(
                 authorization: authorization,
-                transferObserver: transferObserver
+                transferObserver: transferObserver,
+                audioTransferObserver: audioTransferObserver
             )
         }
     }

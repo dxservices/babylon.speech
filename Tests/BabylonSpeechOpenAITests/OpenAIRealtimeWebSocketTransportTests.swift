@@ -7,6 +7,490 @@ import XCTest
 @available(iOS 18, macOS 15, *)
 @MainActor
 final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
+    func testAudioTransferObservationUsesMediaDurationAndPreservesByteFactOrder()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let transferRecorder = TransferRecorder()
+        let audioRecorder = AudioTransferRecorder()
+        let orderRecorder = ObservationOrderRecorder()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                transferRecorder.record(sessionID: sessionID, fact: fact)
+                orderRecorder.record(.transfer(fact.direction))
+            },
+            audioTransferObserver: { sessionID, fact in
+                audioRecorder.record(sessionID: sessionID, fact: fact)
+                orderRecorder.record(.audio(fact.direction))
+            }
+        )
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let updateText = socket.sentTexts[0]
+        let uplinkPayload = Data(count: 960)
+        let uplink = Task { @MainActor in
+            try await channels.sender.send(
+                try makeAudioFrame(
+                    binding: binding,
+                    payload: uplinkPayload
+                )
+            )
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let appendText = socket.sentTexts[1]
+        socket.completeNextSend()
+        try await uplink.value
+
+        let firstAudio = audioMessage(Data(count: 1_920))
+        let malformed = OpenAIRealtimeWebSocketMessage.string(#"{"#)
+        let invalidBase64 = OpenAIRealtimeWebSocketMessage.string(
+            #"{"type":"session.output_audio.delta","delta":"%%%"}"#
+        )
+        let oddAudio = audioMessage(Data(count: 3))
+        let audioAfterEpochEnded = audioMessage(Data(count: 960))
+        let messages = [
+            firstAudio,
+            malformed,
+            invalidBase64,
+            oddAudio,
+            audioAfterEpochEnded,
+        ]
+        for message in messages {
+            socket.emitMessage(message)
+        }
+
+        XCTAssertEqual(
+            transferRecorder.records,
+            [
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes: Int64(updateText.utf8.count)
+                    )
+                ),
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        applicationPayloadBytes: Int64(appendText.utf8.count)
+                    )
+                ),
+            ] + messages.map {
+                TransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        applicationPayloadBytes: $0.applicationPayloadBytes
+                    )
+                )
+            }
+        )
+        XCTAssertEqual(
+            audioRecorder.records,
+            [
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .uplink,
+                        audioDuration: .milliseconds(20)
+                    )
+                ),
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(40)
+                    )
+                ),
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(20)
+                    )
+                ),
+            ]
+        )
+        XCTAssertEqual(
+            orderRecorder.records,
+            [
+                .transfer(.uplink),
+                .transfer(.uplink),
+                .audio(.uplink),
+                .transfer(.downlink),
+                .audio(.downlink),
+                .transfer(.downlink),
+                .transfer(.downlink),
+                .transfer(.downlink),
+                .transfer(.downlink),
+                .audio(.downlink),
+            ]
+        )
+        XCTAssertEqual(channels.receiver?.noSubscriberDiscardCount, 1)
+    }
+
+    func testAudioTransferObservationReportsBeforeEpochAndWithoutReceiver()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let gate = TestRealtimePostUpdateGate()
+        let recorder = AudioTransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = OpenAIRealtimeWebSocketTransport(
+            authorization: .init(clientSecret: "test-client-secret"),
+            connectionFactory: { _ in socket },
+            scheduler: TestRealtimeScheduler(),
+            postUpdateValidationHook: { await gate.waitOnFirstCall() },
+            audioTransferObserver: { sessionID, fact in
+                recorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        let connect = Task { @MainActor in
+            try await transport.connect(
+                targetLanguage: "fr",
+                transcriptionRequested: true,
+                audioBinding: binding,
+                includeDownlink: false
+            )
+        }
+        await waitUntil { socket.resumeCallCount == 1 }
+        socket.emitOpen()
+        await waitUntil { socket.sentTexts.count == 1 }
+        socket.completeNextSend()
+        await waitUntil { gate.isWaiting }
+
+        socket.emitMessage(audioMessage(Data(count: 960)))
+        gate.open()
+        let channels = try await connect.value
+        XCTAssertNil(channels.receiver)
+        socket.emitMessage(audioMessage(Data(count: 1_920)))
+
+        XCTAssertEqual(
+            recorder.records,
+            [
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(20)
+                    )
+                ),
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(40)
+                    )
+                ),
+            ]
+        )
+    }
+
+    func testAudioTransferObservationDrainsGracefullyAndReturnIsBarrier()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let transferRecorder = TransferRecorder()
+        let audioRecorder = AudioTransferRecorder()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                transferRecorder.record(sessionID: sessionID, fact: fact)
+            },
+            audioTransferObserver: { sessionID, fact in
+                audioRecorder.record(sessionID: sessionID, fact: fact)
+            }
+        )
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let retainedMessage = socket.onMessage
+        let send = Task { @MainActor in
+            await audioSendError {
+                try await channels.sender.send(
+                    try self.makeAudioFrame(
+                        binding: binding,
+                        payload: Data(count: 960)
+                    )
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+        let close = Task { @MainActor in
+            await transport.closeGracefully()
+        }
+        await waitUntil { socket.sentTexts.count == 3 }
+        let sendOutcome = await send.value
+        XCTAssertEqual(sendOutcome, .transportClosed)
+
+        socket.completeNextSend()
+        socket.completeNextSend()
+        socket.emitMessage(audioMessage(Data(count: 1_920)))
+        socket.emitMessage(.string(#"{"type":"session.closed"}"#))
+        let closeOutcome = await close.value
+        XCTAssertEqual(closeOutcome, .serverAcknowledged)
+        XCTAssertEqual(
+            audioRecorder.records.map(\.fact),
+            [
+                .init(
+                    direction: .uplink,
+                    audioDuration: .milliseconds(20)
+                ),
+                .init(
+                    direction: .downlink,
+                    audioDuration: .milliseconds(40)
+                ),
+            ]
+        )
+        XCTAssertEqual(
+            transferRecorder.records.map(\.fact.direction),
+            [.uplink, .uplink, .uplink, .downlink, .downlink]
+        )
+
+        let transferFactsAtReturn = transferRecorder.records
+        let audioFactsAtReturn = audioRecorder.records
+        retainedMessage?(.success(audioMessage(Data(count: 960))))
+        socket.completeNextSend()
+        XCTAssertEqual(transferRecorder.records, transferFactsAtReturn)
+        XCTAssertEqual(audioRecorder.records, audioFactsAtReturn)
+    }
+
+    func testAudioTransferObserverReentrancyInvalidatesBeforeSenderReturns()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let orderRecorder = ObservationOrderRecorder()
+        let action = TransferReentrantAction()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { _, fact in
+                orderRecorder.record(.transfer(fact.direction))
+            },
+            audioTransferObserver: { _, fact in
+                orderRecorder.record(.audio(fact.direction))
+                action.run()
+            }
+        )
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        action.operation = { transport.cancelImmediately() }
+        let retainedMessage = socket.onMessage
+        let send = Task { @MainActor in
+            await audioSendError {
+                try await channels.sender.send(
+                    try self.makeAudioFrame(
+                        binding: binding,
+                        payload: Data(count: 960)
+                    )
+                )
+            }
+        }
+        await waitUntil { socket.sentTexts.count == 2 }
+
+        socket.completeNextSend()
+
+        let sendOutcome = await send.value
+        XCTAssertEqual(sendOutcome, .transportClosed)
+        XCTAssertEqual(
+            orderRecorder.records,
+            [
+                .transfer(.uplink),
+                .transfer(.uplink),
+                .audio(.uplink),
+            ]
+        )
+        let recordsAtCancel = orderRecorder.records
+        retainedMessage?(.success(audioMessage(Data(count: 960))))
+        XCTAssertEqual(orderRecorder.records, recordsAtCancel)
+    }
+
+    func testAudioTransferDurationHelperUsesFixedPCM16FormatWithoutTrapping()
+        throws
+    {
+        XCTAssertNil(OpenAIRealtimeWebSocketTransport.audioDuration(
+            forPCM16ByteCount: 0
+        ))
+        XCTAssertNil(OpenAIRealtimeWebSocketTransport.audioDuration(
+            forPCM16ByteCount: 3
+        ))
+        XCTAssertEqual(
+            OpenAIRealtimeWebSocketTransport.audioDuration(
+                forPCM16ByteCount: 960
+            ),
+            .milliseconds(20)
+        )
+        XCTAssertEqual(
+            OpenAIRealtimeWebSocketTransport.audioDuration(
+                forPCM16ByteCount: 1_920
+            ),
+            .milliseconds(40)
+        )
+        XCTAssertNotNil(OpenAIRealtimeWebSocketTransport.audioDuration(
+            forPCM16ByteCount: Int.max - 1
+        ))
+        XCTAssertNil(OpenAIRealtimeWebSocketTransport.audioDuration(
+            forPCM16ByteCount: Int.max
+        ))
+    }
+
+    func testAudioTransferRejectsFailedCancelledAndImmediatePendingUplink()
+        async throws
+    {
+        enum Termination {
+            case socketFailure
+            case callerCancellation
+            case immediateCancellation
+        }
+
+        for termination in [
+            Termination.socketFailure,
+            .callerCancellation,
+            .immediateCancellation,
+        ] {
+            let socket = FakeRealtimeWebSocketConnection()
+            let transferRecorder = TransferRecorder()
+            let audioRecorder = AudioTransferRecorder()
+            let binding = makeAudioBinding()
+            let transport = makeTransport(
+                socket: socket,
+                transferObserver: { sessionID, fact in
+                    transferRecorder.record(sessionID: sessionID, fact: fact)
+                },
+                audioTransferObserver: { sessionID, fact in
+                    audioRecorder.record(sessionID: sessionID, fact: fact)
+                }
+            )
+            let channels = try await finishConnect(
+                transport,
+                socket: socket,
+                binding: binding
+            )
+            let send = Task { @MainActor in
+                await self.audioSendError {
+                    try await channels.sender.send(
+                        try self.makeAudioFrame(
+                            binding: binding,
+                            payload: Data(count: 960)
+                        )
+                    )
+                }
+            }
+            await waitUntil { socket.sentTexts.count == 2 }
+
+            let expectedError: OpenAIRealtimeAudioChannelError
+            switch termination {
+            case .socketFailure:
+                socket.completeNextSend(
+                    error: SensitiveTestError("private send detail")
+                )
+                expectedError = .sendFailed
+            case .callerCancellation:
+                send.cancel()
+                expectedError = .sendCancelled
+            case .immediateCancellation:
+                transport.cancelImmediately()
+                expectedError = .transportClosed
+            }
+
+            let outcome = await send.value
+            XCTAssertEqual(outcome, expectedError)
+            XCTAssertEqual(transferRecorder.records.count, 1)
+            XCTAssertEqual(
+                transferRecorder.records.first?.fact.direction,
+                .uplink
+            )
+            XCTAssertTrue(audioRecorder.records.isEmpty)
+
+            switch termination {
+            case .socketFailure:
+                break
+            case .callerCancellation, .immediateCancellation:
+                socket.completeNextSend()
+                await Task.yield()
+                XCTAssertEqual(transferRecorder.records.count, 1)
+                XCTAssertTrue(audioRecorder.records.isEmpty)
+            }
+            transport.cancelImmediately()
+        }
+    }
+
+    func testDownlinkAudioObserverCancellationStopsDeliveryRearmAndLateFacts()
+        async throws
+    {
+        let socket = FakeRealtimeWebSocketConnection()
+        let transferRecorder = TransferRecorder()
+        let audioRecorder = AudioTransferRecorder()
+        let action = TransferReentrantAction()
+        let binding = makeAudioBinding()
+        let transport = makeTransport(
+            socket: socket,
+            transferObserver: { sessionID, fact in
+                transferRecorder.record(sessionID: sessionID, fact: fact)
+            },
+            audioTransferObserver: { sessionID, fact in
+                audioRecorder.record(sessionID: sessionID, fact: fact)
+                action.run()
+            }
+        )
+        let channels = try await finishConnect(
+            transport,
+            socket: socket,
+            binding: binding
+        )
+        let receiver = try XCTUnwrap(channels.receiver)
+        var iterator = receiver.frames(
+            for: binding.sessionID.audioFlowID
+        ).makeAsyncIterator()
+        let retainedMessage = socket.onMessage
+        action.operation = { transport.cancelImmediately() }
+
+        socket.emitMessage(audioMessage(Data(count: 960)))
+
+        XCTAssertEqual(
+            transferRecorder.records.map(\.fact.direction),
+            [.uplink, .downlink]
+        )
+        XCTAssertEqual(
+            audioRecorder.records,
+            [
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(20)
+                    )
+                ),
+            ]
+        )
+        XCTAssertEqual(socket.receiveCallCount, 1)
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected cancellation before receiver delivery")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .transportClosed)
+        }
+
+        let transferFactsAtCancel = transferRecorder.records
+        let audioFactsAtCancel = audioRecorder.records
+        retainedMessage?(.success(audioMessage(Data(count: 1_920))))
+        XCTAssertEqual(transferRecorder.records, transferFactsAtCancel)
+        XCTAssertEqual(audioRecorder.records, audioFactsAtCancel)
+        XCTAssertEqual(socket.receiveCallCount, 1)
+    }
+
     func testTransferObservationCountsOnlySuccessfulUplinkAndGracefulDrain()
         async throws
     {
@@ -341,6 +825,7 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         let secondSocket = FakeRealtimeWebSocketConnection()
         var sockets = [firstSocket, secondSocket]
         let recorder = TransferRecorder()
+        let audioRecorder = AudioTransferRecorder()
         let binding = makeAudioBinding()
         let transport = OpenAIRealtimeWebSocketTransport(
             authorization: .init(clientSecret: "test-client-secret"),
@@ -348,6 +833,9 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
             scheduler: TestRealtimeScheduler(),
             transferObserver: { sessionID, fact in
                 recorder.record(sessionID: sessionID, fact: fact)
+            },
+            audioTransferObserver: { sessionID, fact in
+                audioRecorder.record(sessionID: sessionID, fact: fact)
             }
         )
         _ = try await finishConnect(
@@ -377,15 +865,15 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         await waitUntil { secondSocket.resumeCallCount == 1 }
         let oldSendOutcome = await oldSend.value
         XCTAssertEqual(oldSendOutcome, .staleFlow)
-        retainedOldMessage?(.success(.string(#"{"type":"old"}"#)))
+        retainedOldMessage?(.success(audioMessage(Data(count: 960))))
         firstSocket.completeNextSend()
         secondSocket.emitOpen()
         await waitUntil { secondSocket.sentTexts.count == 1 }
         secondSocket.completeNextSend()
         _ = try await replacement.value
-        retainedOldMessage?(.success(.string(#"{"type":"older"}"#)))
-        let currentText = #"{"type":"future.current"}"#
-        secondSocket.emitMessage(.string(currentText))
+        retainedOldMessage?(.success(audioMessage(Data(count: 1_920))))
+        let currentMessage = audioMessage(Data(count: 960))
+        secondSocket.emitMessage(currentMessage)
 
         XCTAssertEqual(
             recorder.records,
@@ -410,7 +898,20 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
                     sessionID: binding.sessionID,
                     fact: .init(
                         direction: .downlink,
-                        applicationPayloadBytes: Int64(currentText.utf8.count)
+                        applicationPayloadBytes:
+                            currentMessage.applicationPayloadBytes
+                    )
+                ),
+            ]
+        )
+        XCTAssertEqual(
+            audioRecorder.records,
+            [
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(20)
                     )
                 ),
             ]
@@ -459,14 +960,21 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         async throws
     {
         let recorder = TransferRecorder()
+        let audioRecorder = AudioTransferRecorder()
         let binding = makeAudioBinding()
         let observer: OpenAIRealtimeTransferObserver = { sessionID, fact in
             recorder.record(sessionID: sessionID, fact: fact)
         }
+        let audioObserver: OpenAIRealtimeAudioTransferObserver = {
+            sessionID,
+            fact in
+            audioRecorder.record(sessionID: sessionID, fact: fact)
+        }
         let oldSocket = FakeRealtimeWebSocketConnection()
         let oldTransport = makeTransport(
             socket: oldSocket,
-            transferObserver: observer
+            transferObserver: observer,
+            audioTransferObserver: audioObserver
         )
         _ = try await finishConnect(
             oldTransport,
@@ -479,7 +987,8 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         let newSocket = FakeRealtimeWebSocketConnection()
         let newTransport = makeTransport(
             socket: newSocket,
-            transferObserver: observer
+            transferObserver: observer,
+            audioTransferObserver: audioObserver
         )
         _ = try await finishConnect(
             newTransport,
@@ -488,19 +997,33 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
         )
         let factsBeforeCallbacks = recorder.records
 
-        retainedOldMessage?(.success(.string(#"{"type":"old"}"#)))
+        retainedOldMessage?(.success(audioMessage(Data(count: 960))))
         XCTAssertEqual(recorder.records, factsBeforeCallbacks)
-        let currentText = #"{"type":"current"}"#
-        newSocket.emitMessage(.string(currentText))
+        XCTAssertTrue(audioRecorder.records.isEmpty)
+        let currentMessage = audioMessage(Data(count: 1_920))
+        newSocket.emitMessage(currentMessage)
         XCTAssertEqual(
             recorder.records.last,
             TransferRecord(
                 sessionID: binding.sessionID,
                 fact: .init(
                     direction: .downlink,
-                    applicationPayloadBytes: Int64(currentText.utf8.count)
+                    applicationPayloadBytes:
+                        currentMessage.applicationPayloadBytes
                 )
             )
+        )
+        XCTAssertEqual(
+            audioRecorder.records,
+            [
+                AudioTransferRecord(
+                    sessionID: binding.sessionID,
+                    fact: .init(
+                        direction: .downlink,
+                        audioDuration: .milliseconds(40)
+                    )
+                ),
+            ]
         )
     }
 
@@ -2419,13 +2942,15 @@ final class OpenAIRealtimeWebSocketTransportTests: XCTestCase {
     private func makeTransport(
         socket: FakeRealtimeWebSocketConnection,
         scheduler: TestRealtimeScheduler = TestRealtimeScheduler(),
-        transferObserver: OpenAIRealtimeTransferObserver? = nil
+        transferObserver: OpenAIRealtimeTransferObserver? = nil,
+        audioTransferObserver: OpenAIRealtimeAudioTransferObserver? = nil
     ) -> OpenAIRealtimeWebSocketTransport {
         OpenAIRealtimeWebSocketTransport(
             authorization: .init(clientSecret: "test-client-secret"),
             connectionFactory: { _ in socket },
             scheduler: scheduler,
-            transferObserver: transferObserver
+            transferObserver: transferObserver,
+            audioTransferObserver: audioTransferObserver
         )
     }
 
@@ -2618,6 +3143,41 @@ private final class TransferRecorder {
         fact: OpenAIRealtimeTransferFact
     ) {
         records.append(TransferRecord(sessionID: sessionID, fact: fact))
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+private struct AudioTransferRecord: Equatable {
+    let sessionID: SpeechSessionID
+    let fact: OpenAIRealtimeAudioTransferFact
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class AudioTransferRecorder {
+    private(set) var records: [AudioTransferRecord] = []
+
+    func record(
+        sessionID: SpeechSessionID,
+        fact: OpenAIRealtimeAudioTransferFact
+    ) {
+        records.append(AudioTransferRecord(sessionID: sessionID, fact: fact))
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+private enum ObservationKind: Equatable {
+    case transfer(OpenAIRealtimeTransferDirection)
+    case audio(OpenAIRealtimeTransferDirection)
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class ObservationOrderRecorder {
+    private(set) var records: [ObservationKind] = []
+
+    func record(_ observation: ObservationKind) {
+        records.append(observation)
     }
 }
 

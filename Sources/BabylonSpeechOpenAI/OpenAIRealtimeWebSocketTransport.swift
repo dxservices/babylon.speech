@@ -1,3 +1,4 @@
+import BabylonAudio
 import BabylonSpeech
 import Foundation
 
@@ -120,6 +121,7 @@ final class OpenAIRealtimeWebSocketTransport {
         let epochGeneration: UInt64
         let attemptGeneration: UInt64
         let applicationPayloadBytes: Int64
+        let audioDuration: Duration
     }
 
     private struct CloseWaiter {
@@ -149,6 +151,7 @@ final class OpenAIRealtimeWebSocketTransport {
     private let closeWaiterCancellationHook: CloseWaiterCancellationHook?
     private let uplinkSendCancellationHook: UplinkSendCancellationHook?
     private let transferObserver: OpenAIRealtimeTransferObserver?
+    private let audioTransferObserver: OpenAIRealtimeAudioTransferObserver?
     private var connection: (any OpenAIRealtimeWebSocketConnection)?
     private var openContinuation:
         CheckedContinuation<Result<Void, SpeechProviderFailure>, Never>?
@@ -191,7 +194,8 @@ final class OpenAIRealtimeWebSocketTransport {
         postUpdateValidationHook: PostUpdateValidationHook? = nil,
         closeWaiterCancellationHook: CloseWaiterCancellationHook? = nil,
         uplinkSendCancellationHook: UplinkSendCancellationHook? = nil,
-        transferObserver: OpenAIRealtimeTransferObserver? = nil
+        transferObserver: OpenAIRealtimeTransferObserver? = nil,
+        audioTransferObserver: OpenAIRealtimeAudioTransferObserver? = nil
     ) {
         self.authorization = authorization
         self.wireCodec = wireCodec
@@ -203,6 +207,7 @@ final class OpenAIRealtimeWebSocketTransport {
         self.closeWaiterCancellationHook = closeWaiterCancellationHook
         self.uplinkSendCancellationHook = uplinkSendCancellationHook
         self.transferObserver = transferObserver
+        self.audioTransferObserver = audioTransferObserver
     }
 
     func connect(
@@ -389,6 +394,14 @@ final class OpenAIRealtimeWebSocketTransport {
             )
             return
         }
+        guard let audioDuration = Self.audioDuration(
+            forPCM16ByteCount: payload.count
+        ) else {
+            continuation.resume(
+                returning: .failure(.invalidPCM16Payload)
+            )
+            return
+        }
         guard let event = wireCodec.appendAudioEvent(
             pcm16Audio: payload
         ) else {
@@ -414,7 +427,8 @@ final class OpenAIRealtimeWebSocketTransport {
             connectionGeneration: connectionGeneration,
             epochGeneration: epochGeneration,
             attemptGeneration: attemptGeneration,
-            applicationPayloadBytes: Int64(event.utf8.count)
+            applicationPayloadBytes: Int64(event.utf8.count),
+            audioDuration: audioDuration
         )
         connection.send(text: event) { [weak self] error in
             self?.uplinkSendCompleted(
@@ -475,6 +489,11 @@ final class OpenAIRealtimeWebSocketTransport {
         guard reportTransferIfCurrent(
             direction: .uplink,
             applicationPayloadBytes: transfer.applicationPayloadBytes,
+            generation: connectionGeneration
+        ) else { return }
+        guard reportAudioTransferIfCurrent(
+            direction: .uplink,
+            audioDuration: transfer.audioDuration,
             generation: connectionGeneration
         ) else { return }
         finishUplink(
@@ -825,6 +844,15 @@ final class OpenAIRealtimeWebSocketTransport {
             let event = wireCodec.decode(message)
             switch event {
             case let .translatedAudio(payload):
+                if let audioDuration = Self.audioDuration(
+                    forPCM16ByteCount: payload.count
+                ) {
+                    guard reportAudioTransferIfCurrent(
+                        direction: .downlink,
+                        audioDuration: audioDuration,
+                        generation: generation
+                    ) else { return }
+                }
                 if let audioEpoch,
                    audioEpoch.connectionGeneration == generation
                 {
@@ -1344,6 +1372,50 @@ final class OpenAIRealtimeWebSocketTransport {
             else { return false }
         }
         return true
+    }
+
+    @discardableResult
+    private func reportAudioTransferIfCurrent(
+        direction: OpenAIRealtimeTransferDirection,
+        audioDuration: Duration,
+        generation: UInt64
+    ) -> Bool {
+        guard activeGeneration == generation,
+              !isCancelled
+        else { return false }
+        let observedEpoch = transferEpoch
+        if let observedEpoch,
+           observedEpoch.connectionGeneration == generation,
+           let audioTransferObserver
+        {
+            audioTransferObserver(
+                observedEpoch.sessionID,
+                OpenAIRealtimeAudioTransferFact(
+                    direction: direction,
+                    audioDuration: audioDuration
+                )
+            )
+        }
+        guard activeGeneration == generation,
+              !isCancelled
+        else { return false }
+        if let observedEpoch {
+            guard let currentEpoch = transferEpoch,
+                  currentEpoch.connectionGeneration
+                    == observedEpoch.connectionGeneration,
+                  currentEpoch.sessionID == observedEpoch.sessionID
+            else { return false }
+        }
+        return true
+    }
+
+    nonisolated static func audioDuration(
+        forPCM16ByteCount byteCount: Int
+    ) -> Duration? {
+        guard let format = try? AudioStreamFormat.monoPCM16(
+            sampleRate: 24_000
+        ) else { return nil }
+        return try? format.duration(forPayloadByteCount: byteCount)
     }
 
     private nonisolated static func applicationPayloadBytes(

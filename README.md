@@ -53,6 +53,14 @@ let provider = OpenAIRealtimeSpeechProvider(
         // Aggregate content-free application-payload bytes in app state.
         // Network-interface attribution also remains an app responsibility.
         recordTransfer(sessionID, fact.direction, fact.applicationPayloadBytes)
+    },
+    audioTransferObserver: { sessionID, fact in
+        // Aggregate content-free PCM media duration in app state.
+        recordAudioTransfer(
+            sessionID,
+            fact.direction,
+            fact.audioDuration
+        )
     }
 )
 let configuration = try SpeechSessionConfiguration(
@@ -105,6 +113,20 @@ its channel caller has been released. A completed close outcome is a
 transfer-observation barrier. The package does not buffer observations or
 attribute them to a network; aggregation and network attribution remain
 application responsibilities.
+
+The independent OpenAI-specific audio-transfer observer also runs
+synchronously on the main actor and never receives audio bytes or message
+content. It reports media duration derived from the fixed 24 kHz mono PCM16
+format, not wall-clock, playback, network, or billing duration. Uplink facts
+follow only successful audio-append socket completions; downlink facts follow
+successful decoding of valid, nonempty, frame-aligned translated PCM before
+receiver delivery. A byte-transfer fact is reported first for the same wire
+operation. Audio discarded without a subscriber is still observed, while
+failed sends and invalid PCM are not. Pending successful audio and valid tail
+audio remain observable during graceful drain; immediate cancellation,
+replacement, terminal completion, and a returned close outcome are barriers
+for stale callbacks. Supplying or omitting this observer does not change the
+number or order of application-payload byte facts.
 
 ## Session channels
 

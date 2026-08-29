@@ -14,9 +14,17 @@ final class ModuleImportTests: XCTestCase {
             _ = fact.direction
             _ = fact.applicationPayloadBytes
         }
+        let audioObserver: OpenAIRealtimeAudioTransferObserver = {
+            sessionID,
+            fact in
+            _ = sessionID
+            _ = fact.direction
+            _ = fact.audioDuration
+        }
         let provider: any SpeechProvider = OpenAIRealtimeSpeechProvider(
             authorization: authorization,
-            transferObserver: observer
+            transferObserver: observer,
+            audioTransferObserver: audioObserver
         )
 
         XCTAssertTrue(provider.capabilities.requiresNetwork)
@@ -30,8 +38,10 @@ final class ModuleImportTests: XCTestCase {
         requireSendable(OpenAIRealtimeTransferDirection.uplink)
         requireSendable(OpenAIRealtimeTransferDirection.downlink)
         requireSendableType(OpenAIRealtimeTransferFact.self)
+        requireSendableType(OpenAIRealtimeAudioTransferFact.self)
         requireEquatableType(OpenAIRealtimeTransferDirection.self)
         requireEquatableType(OpenAIRealtimeTransferFact.self)
+        requireEquatableType(OpenAIRealtimeAudioTransferFact.self)
     }
 }
 
