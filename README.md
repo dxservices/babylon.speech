@@ -64,12 +64,27 @@ let eventTask = Task {
 
 try await channels.uplink.send(capturedPCM16Frame)
 
-// Stop from the owning application lifecycle when local work is complete.
+// The original overload remains a graceful, outcome-discarding convenience.
 await provider.stopSession(configuration.sessionID)
 await eventTask.value
 ```
 
 Omit `.transcription` for translation-only sessions. Always stop a session when the application is done with it; after a terminal failure, the application decides whether and when to create a new provider and session.
+
+Applications that must distinguish bounded graceful completion from immediate
+transport cancellation can select a mode and inspect the content-free result:
+
+```swift
+let outcome = await provider.stopSession(
+    configuration.sessionID,
+    mode: .immediate
+)
+```
+
+Immediate stop fails pending uplink work and closes downlink with an error.
+Graceful stop stops uplink first and permits bounded provider output drain;
+only a graceful outcome finishes downlink with normal end-of-stream. Stop
+cleanup is shielded from cancellation of the calling task.
 
 ## Session channels
 

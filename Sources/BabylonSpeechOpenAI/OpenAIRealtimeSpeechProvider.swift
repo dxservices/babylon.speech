@@ -13,6 +13,7 @@ import Foundation
 public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     typealias TransportFactory = @MainActor @Sendable ()
         -> any OpenAIRealtimeSpeechSessionTransport
+    typealias PostStopResultHook = @MainActor @Sendable () async -> Void
 
     /// The fixed S2 OpenAI Realtime feature, authorization, and audio contract.
     ///
@@ -23,6 +24,7 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
 
     private let transportFactory: TransportFactory
     private let initialSegmentRawValue: UInt64
+    private let postStopResultHook: PostStopResultHook?
     private var endpoints: [AudioFlowID: OpenAIRealtimeSpeechSessionEndpoint]
         = [:]
 
@@ -36,6 +38,7 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     public init(authorization: OpenAIRealtimeAuthorization) {
         capabilities = Self.makeCapabilities()
         initialSegmentRawValue = 0
+        postStopResultHook = nil
         transportFactory = {
             OpenAIRealtimeWebSocketTransport(authorization: authorization)
         }
@@ -44,12 +47,14 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
     init(
         authorization: OpenAIRealtimeAuthorization,
         transportFactory: @escaping TransportFactory,
-        initialSegmentRawValue: UInt64 = 0
+        initialSegmentRawValue: UInt64 = 0,
+        postStopResultHook: PostStopResultHook? = nil
     ) {
         _ = authorization
         capabilities = Self.makeCapabilities()
         self.transportFactory = transportFactory
         self.initialSegmentRawValue = initialSegmentRawValue
+        self.postStopResultHook = postStopResultHook
     }
 
     /// Starts an OpenAI Realtime translation session.
@@ -91,7 +96,8 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
             configuration: configuration,
             targetLanguage: targetLanguage.value,
             transport: transportFactory(),
-            initialSegmentRawValue: initialSegmentRawValue
+            initialSegmentRawValue: initialSegmentRawValue,
+            postStopResultHook: postStopResultHook
         ) { [weak self] endpoint in
             self?.removeEndpointIfCurrent(endpoint)
         }
@@ -117,17 +123,23 @@ public final class OpenAIRealtimeSpeechProvider: SpeechProvider {
         }
     }
 
-    /// Stops the current matching session and requests a graceful server close.
+    /// Stops the current matching session using the requested close mode.
     ///
     /// Unknown or stale session identifiers have no effect. The application
     /// remains responsible for any subsequent session or provider creation.
     ///
-    /// - Parameter sessionID: The exact session identity to stop.
-    public func stopSession(_ sessionID: SpeechSessionID) async {
+    /// - Parameters:
+    ///   - sessionID: The exact session identity to stop.
+    ///   - mode: Graceful drain or immediate transport cancellation.
+    /// - Returns: The content-free terminal stop outcome.
+    public func stopSession(
+        _ sessionID: SpeechSessionID,
+        mode: SpeechSessionStopMode
+    ) async -> SpeechSessionStopOutcome {
         guard let endpoint = endpoints[sessionID.audioFlowID],
               endpoint.sessionID == sessionID
-        else { return }
-        await endpoint.stopByConsumer()
+        else { return .noMatchingSession }
+        return await endpoint.stopByConsumer(mode: mode)
     }
 
     private func removeEndpointIfCurrent(
@@ -194,6 +206,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
     private enum State {
         case starting
         case active
+        case stopping
         case terminal
     }
 
@@ -206,6 +219,8 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
     private let transport: any OpenAIRealtimeSpeechSessionTransport
     private let events: AsyncStream<SpeechEvent>
     private let eventContinuation: AsyncStream<SpeechEvent>.Continuation
+    private let postStopResultHook:
+        OpenAIRealtimeSpeechProvider.PostStopResultHook?
     private let onFinished: @MainActor @Sendable (
         OpenAIRealtimeSpeechSessionEndpoint
     ) -> Void
@@ -216,12 +231,18 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
     private var audioChannels: OpenAIRealtimeAudioChannels?
     private var failureCorrelationGeneration: UInt64 = 0
     private var immediatelyCorrelatedFailure: CorrelatedFailure?
+    private var stopTask: Task<SpeechSessionStopOutcome, Never>?
+    private var stopOutcome: SpeechSessionStopOutcome?
+    private var didFinishLifecycle = false
+    private var didRequestImmediateCancel = false
 
     init(
         configuration: SpeechSessionConfiguration,
         targetLanguage: String,
         transport: any OpenAIRealtimeSpeechSessionTransport,
         initialSegmentRawValue: UInt64,
+        postStopResultHook:
+            OpenAIRealtimeSpeechProvider.PostStopResultHook?,
         onFinished: @escaping @MainActor @Sendable (
             OpenAIRealtimeSpeechSessionEndpoint
         ) -> Void
@@ -230,6 +251,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
         sessionID = configuration.sessionID
         self.targetLanguage = targetLanguage
         self.transport = transport
+        self.postStopResultHook = postStopResultHook
         self.onFinished = onFinished
         mapper = OpenAIRealtimeSpeechEventMapper(
             configuration: configuration,
@@ -258,7 +280,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             let reportedFailure = startingFailure ?? failure
             if state != .terminal {
                 terminateBeforeStart(failure: reportedFailure)
-                transport.cancelImmediately()
+                requestImmediateCancelOnce()
             }
             throw reportedFailure
         }
@@ -268,7 +290,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
                 uplinkError: .transportClosed,
                 downlinkError: .transportClosed
             )
-            transport.cancelImmediately()
+            requestImmediateCancelOnce()
             throw startingFailure ?? Self.connectionCancelledFailure
         }
 
@@ -294,9 +316,16 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
     }
 
     func replace() {
-        guard state != .terminal else { return }
-        if state == .starting {
+        switch state {
+        case .terminal:
+            return
+        case .stopping:
+            lockImmediateStop(channelError: .staleFlow)
+            return
+        case .starting:
             startingFailure = Self.connectionCancelledFailure
+        case .active:
+            break
         }
         state = .terminal
         yield(mapper.finish(reason: .replaced))
@@ -306,37 +335,108 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             downlinkError: .staleFlow
         )
         finishEventStreamAndDetach()
-        transport.cancelImmediately()
+        requestImmediateCancelOnce()
     }
 
-    func stopByConsumer() async {
-        guard state != .terminal else { return }
-        if state == .starting {
+    func stopByConsumer(
+        mode: SpeechSessionStopMode
+    ) async -> SpeechSessionStopOutcome {
+        switch state {
+        case .terminal:
+            return stopOutcome ?? .noMatchingSession
+        case .stopping:
+            return await joinStop(mode: mode)
+        case .starting:
             startingFailure = Self.connectionCancelledFailure
             state = .terminal
+            stopOutcome = .immediate
             yield(mapper.finish(reason: .consumerRequested))
             stagedEvents.removeAll(keepingCapacity: false)
             finishEventStreamAndDetach()
-            transport.cancelImmediately()
-            return
+            requestImmediateCancelOnce()
+            return .immediate
+        case .active:
+            break
         }
 
-        state = .terminal
-        audioChannels?.stopUplink(error: .transportClosed)
         yield(mapper.finish(reason: .consumerRequested))
-        finishEventStreamAndDetach()
+        if mode == .immediate {
+            state = .terminal
+            stopOutcome = .immediate
+            audioChannels?.finish(
+                uplinkError: .transportClosed,
+                downlinkError: .transportClosed
+            )
+            audioChannels = nil
+            finishEventStreamAndDetach()
+            requestImmediateCancelOnce()
+            return .immediate
+        }
 
-        let closeTask = Task { @MainActor [transport] in
-            await transport.closeGracefully()
+        state = .stopping
+        audioChannels?.stopUplink(error: .transportClosed)
+        finishEventStreamForStop()
+
+        let closeTask = Task {
+            @MainActor [transport, postStopResultHook] in
+            let outcome = Self.stopOutcome(
+                for: await transport.closeGracefully()
+            )
+            if let postStopResultHook {
+                await postStopResultHook()
+            }
+            return outcome
         }
-        let outcome = await closeTask.value
-        switch outcome {
-        case .serverAcknowledged, .localGraceful:
-            audioChannels?.finishDownlink(error: nil)
-        case .localImmediate, .localForcedAfterTimeout, .waitCancelled, .failed:
-            audioChannels?.finishDownlink(error: .transportClosed)
+        stopTask = closeTask
+        return completeStop(with: await closeTask.value)
+    }
+
+    private func joinStop(
+        mode: SpeechSessionStopMode
+    ) async -> SpeechSessionStopOutcome {
+        guard let stopTask else {
+            return stopOutcome ?? .failed
         }
-        audioChannels = nil
+        if mode == .immediate {
+            lockImmediateStop(channelError: .transportClosed)
+        }
+        return completeStop(with: await stopTask.value)
+    }
+
+    private func completeStop(
+        with outcome: SpeechSessionStopOutcome
+    ) -> SpeechSessionStopOutcome {
+        let resolvedOutcome = stopOutcome ?? outcome
+        if stopOutcome == nil {
+            stopOutcome = outcome
+            state = .terminal
+            switch outcome {
+            case .graceful:
+                audioChannels?.finishDownlink(error: nil)
+            case .immediate, .forced, .failed, .noMatchingSession:
+                audioChannels?.finishDownlink(error: .transportClosed)
+            }
+            audioChannels = nil
+        }
+        stopTask = nil
+        notifyFinishedOnce()
+        return resolvedOutcome
+    }
+
+    private func lockImmediateStop(
+        channelError: OpenAIRealtimeAudioChannelError
+    ) {
+        if stopOutcome == nil {
+            stopOutcome = .immediate
+            state = .terminal
+            audioChannels?.finish(
+                uplinkError: channelError,
+                downlinkError: channelError
+            )
+            audioChannels = nil
+            finishEventStreamAndDetach()
+        }
+        requestImmediateCancelOnce()
     }
 
     private func installCallbacks() {
@@ -354,7 +454,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             receiveStarting(event)
         case .active:
             receiveActive(event)
-        case .terminal:
+        case .stopping, .terminal:
             return
         }
     }
@@ -364,10 +464,8 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             startingFailure = Self.connectionClosedFailure
             state = .terminal
             stagedEvents.removeAll(keepingCapacity: false)
-            eventContinuation.finish()
-            detachCallbacks()
-            onFinished(self)
-            transport.cancelImmediately()
+            finishEventStreamAndDetach()
+            requestImmediateCancelOnce()
             return
         }
         guard stagedEvents.count < Self.stagingLimit else {
@@ -375,10 +473,8 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             startingFailure = failure
             state = .terminal
             stagedEvents.removeAll(keepingCapacity: false)
-            eventContinuation.finish()
-            detachCallbacks()
-            onFinished(self)
-            transport.cancelImmediately()
+            finishEventStreamAndDetach()
+            requestImmediateCancelOnce()
             return
         }
         stagedEvents.append(event)
@@ -425,7 +521,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
                 uplinkError: .transportClosed,
                 downlinkError: .transportClosed
             )
-        case .terminal:
+        case .stopping, .terminal:
             return
         }
     }
@@ -438,7 +534,7 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
             downlinkError: downlinkError
         )
         if reason == .failed {
-            transport.cancelImmediately()
+            requestImmediateCancelOnce()
         }
     }
 
@@ -461,20 +557,35 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
         startingFailure = failure
         state = .terminal
         stagedEvents.removeAll(keepingCapacity: false)
-        eventContinuation.finish()
-        detachCallbacks()
-        onFinished(self)
+        finishEventStreamAndDetach()
     }
 
     private func finishEventStreamAndDetach() {
         eventContinuation.finish()
         detachCallbacks()
-        onFinished(self)
+        notifyFinishedOnce()
+    }
+
+    private func finishEventStreamForStop() {
+        eventContinuation.finish()
+        detachCallbacks()
     }
 
     private func detachCallbacks() {
         transport.onEvent = nil
         transport.onTerminal = nil
+    }
+
+    private func notifyFinishedOnce() {
+        guard !didFinishLifecycle else { return }
+        didFinishLifecycle = true
+        onFinished(self)
+    }
+
+    private func requestImmediateCancelOnce() {
+        guard !didRequestImmediateCancel else { return }
+        didRequestImmediateCancel = true
+        transport.cancelImmediately()
     }
 
     private func yield(_ events: [SpeechEvent]) {
@@ -488,6 +599,21 @@ private final class OpenAIRealtimeSpeechSessionEndpoint {
     ) -> SpeechSessionEndReason? {
         guard case let .sessionEnded(_, reason) = event else { return nil }
         return reason
+    }
+
+    private nonisolated static func stopOutcome(
+        for outcome: OpenAIRealtimeCloseOutcome
+    ) -> SpeechSessionStopOutcome {
+        switch outcome {
+        case .serverAcknowledged, .localGraceful:
+            .graceful
+        case .localImmediate:
+            .immediate
+        case .localForcedAfterTimeout:
+            .forced
+        case .waitCancelled, .failed:
+            .failed
+        }
     }
 
     private nonisolated static let connectionCancelledFailure =

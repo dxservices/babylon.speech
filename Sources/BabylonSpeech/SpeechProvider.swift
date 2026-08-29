@@ -5,6 +5,28 @@ public enum SpeechCredentialRequirement: Equatable, Sendable {
     case callerInjected
 }
 
+/// The application-selected way to stop a speech session.
+public enum SpeechSessionStopMode: Equatable, Sendable {
+    /// Stop uplink and allow provider output to drain to a bounded close.
+    case graceful
+    /// Cancel provider transport and all session channels immediately.
+    case immediate
+}
+
+/// A content-free result describing how a speech session stopped.
+public enum SpeechSessionStopOutcome: Equatable, Sendable {
+    /// The provider had no current session with the supplied identity.
+    case noMatchingSession
+    /// The provider completed its graceful close contract.
+    case graceful
+    /// The provider cancelled the session without graceful drain.
+    case immediate
+    /// A graceful request reached its provider-defined bounded fallback.
+    case forced
+    /// The provider could not complete its requested stop contract.
+    case failed
+}
+
 @available(iOS 18, macOS 13, *)
 public struct SpeechProviderCapabilities: Equatable, Sendable {
     public let requiresNetwork: Bool
@@ -170,5 +192,22 @@ public protocol SpeechProvider: Sendable {
         _ configuration: SpeechSessionConfiguration
     ) async throws(SpeechProviderFailure) -> SpeechSessionChannels
 
-    func stopSession(_ sessionID: SpeechSessionID) async
+    /// Stops an exact session using application-selected close semantics.
+    @discardableResult
+    func stopSession(
+        _ sessionID: SpeechSessionID,
+        mode: SpeechSessionStopMode
+    ) async -> SpeechSessionStopOutcome
+}
+
+@available(iOS 18, macOS 13, *)
+public extension SpeechProvider {
+    /// Stops an exact session gracefully and discards the stop outcome.
+    ///
+    /// This overload preserves the original caller-facing API. Use
+    /// ``stopSession(_:mode:)`` when the application needs immediate stop or
+    /// must inspect the terminal outcome.
+    func stopSession(_ sessionID: SpeechSessionID) async {
+        _ = await stopSession(sessionID, mode: .graceful)
+    }
 }

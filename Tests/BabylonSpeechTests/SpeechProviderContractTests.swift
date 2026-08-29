@@ -5,6 +5,60 @@ import Testing
 
 @Suite("Speech provider session channels")
 struct SpeechProviderContractTests {
+    @Test("Stop modes dispatch through the provider existential")
+    func stopModesDispatchThroughExistential() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let implementation = ContractFakeProvider(
+            capabilities: .cloud(inputFormat: format, outputFormat: format),
+            downlinkFormat: format
+        )
+        let provider: any SpeechProvider = implementation
+        let configuration = try makeConfiguration(flowID: AudioFlowID())
+        _ = try await provider.startSession(configuration)
+
+        let outcome = await provider.stopSession(
+            configuration.sessionID,
+            mode: .immediate
+        )
+
+        #expect(outcome == .immediate)
+        #expect(await implementation.stopModes == [.immediate])
+        #expect(
+            await provider.stopSession(
+                configuration.sessionID,
+                mode: .graceful
+            ) == .noMatchingSession
+        )
+    }
+
+    @Test("The legacy stop overload remains a graceful Void convenience")
+    func legacyStopRemainsGracefulVoidConvenience() async throws {
+        let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
+        let implementation = ContractFakeProvider(
+            capabilities: .cloud(inputFormat: format, outputFormat: format),
+            downlinkFormat: format
+        )
+        let provider: any SpeechProvider = implementation
+        let configuration = try makeConfiguration(flowID: AudioFlowID())
+        _ = try await provider.startSession(configuration)
+
+        let result: Void = await provider.stopSession(configuration.sessionID)
+
+        #expect(result == ())
+        #expect(await implementation.stopModes == [.graceful])
+    }
+
+    @Test("Stop mode and outcome values are Sendable")
+    func stopValuesAreSendable() {
+        requireSendable(SpeechSessionStopMode.graceful)
+        requireSendable(SpeechSessionStopMode.immediate)
+        requireSendable(SpeechSessionStopOutcome.noMatchingSession)
+        requireSendable(SpeechSessionStopOutcome.graceful)
+        requireSendable(SpeechSessionStopOutcome.immediate)
+        requireSendable(SpeechSessionStopOutcome.forced)
+        requireSendable(SpeechSessionStopOutcome.failed)
+    }
+
     @Test("A 24 kHz cloud-shaped provider exposes uplink and downlink through the existential")
     func openAIShapedChannels() async throws {
         let format = try AudioStreamFormat.monoPCM16(sampleRate: 24_000)
@@ -275,6 +329,7 @@ private actor ContractFakeProvider: SpeechProvider {
     private let downlinkFormat: AudioStreamFormat?
     private var endpoints: [SpeechSessionID: ContractSessionEndpoint] = [:]
     private(set) var receivedFrameCount = 0
+    private(set) var stopModes: [SpeechSessionStopMode] = []
 
     init(
         capabilities: SpeechProviderCapabilities,
@@ -306,9 +361,16 @@ private actor ContractFakeProvider: SpeechProvider {
         return await endpoint.makeChannels()
     }
 
-    func stopSession(_ sessionID: SpeechSessionID) async {
-        guard let endpoint = endpoints.removeValue(forKey: sessionID) else { return }
+    func stopSession(
+        _ sessionID: SpeechSessionID,
+        mode: SpeechSessionStopMode
+    ) async -> SpeechSessionStopOutcome {
+        stopModes.append(mode)
+        guard let endpoint = endpoints.removeValue(forKey: sessionID) else {
+            return .noMatchingSession
+        }
         await endpoint.stop(reason: .consumerRequested)
+        return mode == .graceful ? .graceful : .immediate
     }
 
     private func recordFrame() {
@@ -482,6 +544,8 @@ private final class FramePipe: @unchecked Sendable {
 private actor RecordingSender: AudioFrameSender {
     func send(_ frame: AudioFrame) async throws {}
 }
+
+private func requireSendable<T: Sendable>(_: T) {}
 
 private struct FixedReceiver: AudioFrameReceiver {
     let storedFrames: [AudioFrame]

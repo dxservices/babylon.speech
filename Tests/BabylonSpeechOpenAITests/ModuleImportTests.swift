@@ -19,5 +19,9 @@ final class ModuleImportTests: XCTestCase {
             .callerInjected
         )
         XCTAssertEqual(provider.capabilities.requiredFeatures, [.translation])
+        requireSendable(SpeechSessionStopMode.immediate)
+        requireSendable(SpeechSessionStopOutcome.forced)
     }
 }
+
+private func requireSendable<T: Sendable>(_: T) {}

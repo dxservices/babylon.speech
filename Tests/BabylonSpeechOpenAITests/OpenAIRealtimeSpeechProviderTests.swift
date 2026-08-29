@@ -525,9 +525,13 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
         await waitUntil { factory.transports.count == 1 }
         await waitUntil { factory.transports[0].isConnectPending }
 
-        await provider.stopSession(configuration.sessionID)
+        let outcome = await provider.stopSession(
+            configuration.sessionID,
+            mode: .graceful
+        )
         let failure = await taskFailure(pending)
 
+        XCTAssertEqual(outcome, .immediate)
         XCTAssertEqual(failure.code?.value, "connection_cancelled")
         XCTAssertEqual(factory.transports[0].cancelCallCount, 1)
 
@@ -551,7 +555,10 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
         ).makeAsyncIterator()
         context.transport.emit(.translatedTranscriptDelta("partial"))
 
-        await context.provider.stopSession(context.configuration.sessionID)
+        let outcome = await context.provider.stopSession(
+            context.configuration.sessionID,
+            mode: .graceful
+        )
         await waitUntil { probe.isComplete }
 
         XCTAssertEqual(probe.events.suffix(2), [
@@ -567,25 +574,31 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
         ])
         let terminalFrame = try await iterator.next()
         XCTAssertNil(terminalFrame)
+        XCTAssertEqual(outcome, .graceful)
         XCTAssertEqual(context.transport.closeCallCount, 1)
     }
 
     func testStopFirstWinsConsumerReasonAcrossLateCloseOutcomes()
         async throws
     {
-        let outcomes: [OpenAIRealtimeCloseOutcome] = [
-            .serverAcknowledged,
-            .failed,
-            .localForcedAfterTimeout,
+        let outcomes: [(OpenAIRealtimeCloseOutcome, SpeechSessionStopOutcome)] = [
+            (.serverAcknowledged, .graceful),
+            (.localGraceful, .graceful),
+            (.failed, .failed),
+            (.localForcedAfterTimeout, .forced),
         ]
-        for outcome in outcomes {
+        for (transportOutcome, expectedOutcome) in outcomes {
             let context = try await makeConnectedProvider()
-            context.transport.closeOutcome = outcome
+            context.transport.closeOutcome = transportOutcome
             let probe = SpeechEventProbe(stream: context.channels.events)
 
-            await context.provider.stopSession(context.configuration.sessionID)
+            let outcome = await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
             await waitUntil { probe.isComplete }
 
+            XCTAssertEqual(outcome, expectedOutcome)
             XCTAssertEqual(probe.events, [
                 .sessionStarted(sessionID: context.configuration.sessionID),
                 .sessionEnded(
@@ -596,12 +609,47 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
         }
     }
 
+    func testNonGracefulStopOutcomesFinishDownlinkWithFixedError()
+        async throws
+    {
+        let cases: [(OpenAIRealtimeCloseOutcome, SpeechSessionStopOutcome)] = [
+            (.localImmediate, .immediate),
+            (.localForcedAfterTimeout, .forced),
+            (.waitCancelled, .failed),
+            (.failed, .failed),
+        ]
+        for (transportOutcome, expectedOutcome) in cases {
+            let context = try await makeConnectedProvider()
+            context.transport.closeOutcome = transportOutcome
+            let receiver = try XCTUnwrap(context.channels.downlink)
+            var iterator = receiver.frames(
+                for: context.configuration.sessionID.audioFlowID
+            ).makeAsyncIterator()
+
+            let outcome = await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+
+            XCTAssertEqual(outcome, expectedOutcome)
+            do {
+                _ = try await iterator.next()
+                XCTFail("Expected a non-graceful downlink error")
+            } catch let error as OpenAIRealtimeAudioChannelError {
+                XCTAssertEqual(error, .transportClosed)
+            }
+        }
+    }
+
     func testStopDetachesTextBeforeGracefulDrainCompletes() async throws {
         let context = try await makeConnectedProvider()
         context.transport.suspendsClose = true
         let probe = SpeechEventProbe(stream: context.channels.events)
         let stop = Task { @MainActor in
-            await context.provider.stopSession(context.configuration.sessionID)
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
         }
         await waitUntil { context.transport.isClosePending }
         await waitUntil { probe.isComplete }
@@ -611,8 +659,9 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
             makeFailure(code: "late_terminal")
         )
         context.transport.completeClose(.localForcedAfterTimeout)
-        await stop.value
+        let outcome = await stop.value
 
+        XCTAssertEqual(outcome, .forced)
         XCTAssertEqual(probe.events, [
             .sessionStarted(sessionID: context.configuration.sessionID),
             .sessionEnded(
@@ -620,6 +669,393 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
                 reason: .consumerRequested
             ),
         ])
+    }
+
+    func testUnknownAndStoppedSessionReturnNoMatchingSession() async throws {
+        let factory = TestSpeechTransportFactory()
+        let provider = makeProvider(factory: factory)
+        let unknown = SpeechSessionID(audioFlowID: AudioFlowID())
+
+        let unknownOutcome = await provider.stopSession(
+            unknown,
+            mode: .immediate
+        )
+        XCTAssertEqual(unknownOutcome, .noMatchingSession)
+
+        let context = try await makeConnectedProvider(
+            provider: provider,
+            factory: factory
+        )
+        let immediateOutcome = await provider.stopSession(
+            context.configuration.sessionID,
+            mode: .immediate
+        )
+        let stoppedOutcome = await provider.stopSession(
+            context.configuration.sessionID,
+            mode: .graceful
+        )
+        XCTAssertEqual(immediateOutcome, .immediate)
+        XCTAssertEqual(stoppedOutcome, .noMatchingSession)
+    }
+
+    func testConcurrentGracefulStopsShareOneTransportClose() async throws {
+        let context = try await makeConnectedProvider()
+        context.transport.suspendsClose = true
+
+        let first = Task { @MainActor in
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { context.transport.isClosePending }
+        let second = Task { @MainActor in
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        XCTAssertEqual(context.transport.closeCallCount, 1)
+        context.transport.completeClose(.serverAcknowledged)
+        let firstOutcome = await first.value
+        let secondOutcome = await second.value
+        XCTAssertEqual(firstOutcome, .graceful)
+        XCTAssertEqual(secondOutcome, .graceful)
+    }
+
+    func testImmediateEscalatesGracefulStopAndLateCloseCannotWin()
+        async throws
+    {
+        let context = try await makeConnectedProvider()
+        context.transport.suspendsClose = true
+        let probe = SpeechEventProbe(stream: context.channels.events)
+        let graceful = Task { @MainActor in
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { context.transport.isClosePending }
+
+        let immediate = await context.provider.stopSession(
+            context.configuration.sessionID,
+            mode: .immediate
+        )
+        context.transport.completeClose(.serverAcknowledged)
+
+        XCTAssertEqual(immediate, .immediate)
+        let gracefulOutcome = await graceful.value
+        XCTAssertEqual(gracefulOutcome, .immediate)
+        XCTAssertEqual(context.transport.closeCallCount, 1)
+        XCTAssertEqual(context.transport.cancelCallCount, 1)
+        await waitUntil { probe.isComplete }
+        XCTAssertEqual(probe.events, [
+            .sessionStarted(sessionID: context.configuration.sessionID),
+            .sessionEnded(
+                sessionID: context.configuration.sessionID,
+                reason: .consumerRequested
+            ),
+        ])
+    }
+
+    func testImmediateWinsAfterCloseResultBeforeEndpointCompletion()
+        async throws
+    {
+        let factory = TestSpeechTransportFactory()
+        let gate = StopResultGate()
+        let provider = makeProvider(
+            factory: factory,
+            postStopResultHook: { await gate.wait() }
+        )
+        let context = try await makeConnectedProvider(
+            provider: provider,
+            factory: factory
+        )
+        context.transport.suspendsClose = true
+        let probe = SpeechEventProbe(stream: context.channels.events)
+        let firstGraceful = Task { @MainActor in
+            await provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { context.transport.isClosePending }
+        let secondGraceful = Task { @MainActor in
+            await provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        context.transport.completeClose(.serverAcknowledged)
+        await waitUntil { gate.isWaiting }
+
+        let firstImmediate = Task { @MainActor in
+            await provider.stopSession(
+                context.configuration.sessionID,
+                mode: .immediate
+            )
+        }
+        await waitUntil { context.transport.cancelCallCount == 1 }
+        let secondImmediate = Task { @MainActor in
+            await provider.stopSession(
+                context.configuration.sessionID,
+                mode: .immediate
+            )
+        }
+        for _ in 0..<10 { await Task.yield() }
+        gate.release()
+
+        let firstGracefulOutcome = await firstGraceful.value
+        let secondGracefulOutcome = await secondGraceful.value
+        let firstImmediateOutcome = await firstImmediate.value
+        let secondImmediateOutcome = await secondImmediate.value
+        let outcomes = [
+            firstGracefulOutcome,
+            secondGracefulOutcome,
+            firstImmediateOutcome,
+        ]
+        XCTAssertEqual(outcomes, [.immediate, .immediate, .immediate])
+        XCTAssertEqual(secondImmediateOutcome, .noMatchingSession)
+        XCTAssertEqual(context.transport.cancelCallCount, 1)
+        await waitUntil { probe.isComplete }
+        XCTAssertEqual(probe.events.filter { event in
+            if case .sessionEnded = event { return true }
+            return false
+        }.count, 1)
+    }
+
+    func testReplacementWinsAfterCloseResultWithoutRemovingNewEndpoint()
+        async throws
+    {
+        let factory = TestSpeechTransportFactory()
+        let gate = StopResultGate()
+        let provider = makeProvider(
+            factory: factory,
+            postStopResultHook: { await gate.wait() }
+        )
+        let flowID = AudioFlowID()
+        let old = try await makeConnectedProvider(
+            provider: provider,
+            factory: factory,
+            flowID: flowID
+        )
+        old.transport.suspendsClose = true
+        let oldStop = Task { @MainActor in
+            await provider.stopSession(
+                old.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { old.transport.isClosePending }
+        old.transport.completeClose(.serverAcknowledged)
+        await waitUntil { gate.isWaiting }
+
+        let replacementConfiguration = try makeConfiguration(flowID: flowID)
+        let replacement = Task { @MainActor in
+            try await provider.startSession(replacementConfiguration)
+        }
+        await waitUntil { factory.transports.count == 2 }
+        let staleImmediate = await provider.stopSession(
+            old.configuration.sessionID,
+            mode: .immediate
+        )
+        gate.release()
+        let oldOutcome = await oldStop.value
+        let replacementTransport = factory.transports[1]
+        replacementTransport.completeConnect()
+        let replacementChannels = try await replacement.value
+
+        XCTAssertEqual(staleImmediate, .noMatchingSession)
+        XCTAssertEqual(oldOutcome, .immediate)
+        XCTAssertEqual(old.transport.cancelCallCount, 1)
+        try await replacementChannels.uplink.send(
+            try makeFrame(flowID: flowID)
+        )
+        XCTAssertEqual(replacementTransport.sentPayloads.count, 1)
+        let replacementStop = await provider.stopSession(
+            replacementConfiguration.sessionID,
+            mode: .immediate
+        )
+        XCTAssertEqual(replacementStop, .immediate)
+    }
+
+    func testGracefulAfterImmediateCannotRestartOrDowngradeStop()
+        async throws
+    {
+        let context = try await makeConnectedProvider()
+
+        let immediateOutcome = await context.provider.stopSession(
+            context.configuration.sessionID,
+            mode: .immediate
+        )
+        let laterGracefulOutcome = await context.provider.stopSession(
+            context.configuration.sessionID,
+            mode: .graceful
+        )
+        XCTAssertEqual(immediateOutcome, .immediate)
+        XCTAssertEqual(laterGracefulOutcome, .noMatchingSession)
+        XCTAssertEqual(context.transport.cancelCallCount, 1)
+        XCTAssertEqual(context.transport.closeCallCount, 0)
+    }
+
+    func testStopWaitIsShieldedFromCallerCancellation() async throws {
+        let context = try await makeConnectedProvider()
+        context.transport.suspendsClose = true
+        let stop = Task { @MainActor in
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { context.transport.isClosePending }
+
+        stop.cancel()
+        for _ in 0..<10 { await Task.yield() }
+        XCTAssertEqual(context.transport.cancelCallCount, 0)
+        context.transport.completeClose(.serverAcknowledged)
+
+        let outcome = await stop.value
+        XCTAssertEqual(outcome, .graceful)
+        XCTAssertEqual(context.transport.closeCallCount, 1)
+    }
+
+    func testImmediateStopResumesPendingUplinkAndErrorsDownlink()
+        async throws
+    {
+        let context = try await makeConnectedProvider()
+        context.transport.suspendsSend = true
+        let receiver = try XCTUnwrap(context.channels.downlink)
+        var iterator = receiver.frames(
+            for: context.configuration.sessionID.audioFlowID
+        ).makeAsyncIterator()
+        let sending = Task { @MainActor in
+            try await context.channels.uplink.send(
+                try makeFrame(
+                    flowID: context.configuration.sessionID.audioFlowID
+                )
+            )
+        }
+        await waitUntil { context.transport.isSendPending }
+
+        let outcome = await context.provider.stopSession(
+            context.configuration.sessionID,
+            mode: .immediate
+        )
+
+        XCTAssertEqual(outcome, .immediate)
+        do {
+            try await sending.value
+            XCTFail("Expected pending uplink failure")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .transportClosed)
+        }
+        do {
+            _ = try await iterator.next()
+            XCTFail("Expected downlink terminal error")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .transportClosed)
+        }
+    }
+
+    func testGracefulStopFailsPendingUplinkButDrainsFinalDownlink()
+        async throws
+    {
+        let context = try await makeConnectedProvider()
+        context.transport.suspendsSend = true
+        context.transport.suspendsClose = true
+        let receiver = try XCTUnwrap(context.channels.downlink)
+        var iterator = receiver.frames(
+            for: context.configuration.sessionID.audioFlowID
+        ).makeAsyncIterator()
+        let sending = Task { @MainActor in
+            try await context.channels.uplink.send(
+                try makeFrame(
+                    flowID: context.configuration.sessionID.audioFlowID
+                )
+            )
+        }
+        await waitUntil { context.transport.isSendPending }
+
+        let stop = Task { @MainActor in
+            await context.provider.stopSession(
+                context.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { context.transport.isClosePending }
+        do {
+            try await sending.value
+            XCTFail("Expected graceful stop to fail pending uplink")
+        } catch let error as OpenAIRealtimeAudioChannelError {
+            XCTAssertEqual(error, .transportClosed)
+        }
+
+        let receiveResult = try XCTUnwrap(
+            context.transport.channels?.receiver
+        ).receivePCM16(Data([0x01, 0x02]))
+        guard case let .accepted(frame) = receiveResult else {
+            return XCTFail("Expected final downlink during graceful drain")
+        }
+        let deliveredFrame = try await iterator.next()
+        XCTAssertEqual(deliveredFrame, frame)
+
+        context.transport.completeClose(.serverAcknowledged)
+        let outcome = await stop.value
+        let terminalFrame = try await iterator.next()
+        XCTAssertEqual(outcome, .graceful)
+        XCTAssertNil(terminalFrame)
+    }
+
+    func testReplacementEscalatesOldGracefulStopWithoutTouchingNewSession()
+        async throws
+    {
+        let factory = TestSpeechTransportFactory()
+        let provider = makeProvider(factory: factory)
+        let flowID = AudioFlowID()
+        let old = try await makeConnectedProvider(
+            provider: provider,
+            factory: factory,
+            flowID: flowID
+        )
+        old.transport.suspendsClose = true
+        let oldProbe = SpeechEventProbe(stream: old.channels.events)
+        let oldStop = Task { @MainActor in
+            await provider.stopSession(
+                old.configuration.sessionID,
+                mode: .graceful
+            )
+        }
+        await waitUntil { old.transport.isClosePending }
+
+        let replacementConfiguration = try makeConfiguration(flowID: flowID)
+        let replacement = Task { @MainActor in
+            try await provider.startSession(replacementConfiguration)
+        }
+        await waitUntil { factory.transports.count == 2 }
+        let replacementTransport = factory.transports[1]
+        replacementTransport.completeConnect()
+        let replacementChannels = try await replacement.value
+        old.transport.completeClose(.serverAcknowledged)
+
+        let oldOutcome = await oldStop.value
+        XCTAssertEqual(oldOutcome, .immediate)
+        XCTAssertEqual(old.transport.cancelCallCount, 1)
+        await waitUntil { oldProbe.isComplete }
+        XCTAssertEqual(oldProbe.events.last, .sessionEnded(
+            sessionID: old.configuration.sessionID,
+            reason: .consumerRequested
+        ))
+        try await replacementChannels.uplink.send(
+            try makeFrame(flowID: flowID)
+        )
+        XCTAssertEqual(replacementTransport.sentPayloads.count, 1)
+        let replacementStop = await provider.stopSession(
+            replacementConfiguration.sessionID,
+            mode: .immediate
+        )
+        XCTAssertEqual(replacementStop, .immediate)
     }
 
     func testNetworkTerminalEmitsFailureBeforeFlushAndFailedEnd()
@@ -734,12 +1170,14 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
 
     private func makeProvider(
         factory: TestSpeechTransportFactory,
-        initialSegmentRawValue: UInt64 = 0
+        initialSegmentRawValue: UInt64 = 0,
+        postStopResultHook: (@MainActor @Sendable () async -> Void)? = nil
     ) -> OpenAIRealtimeSpeechProvider {
         OpenAIRealtimeSpeechProvider(
             authorization: .init(clientSecret: "test-client-secret"),
             transportFactory: { factory.makeTransport() },
-            initialSegmentRawValue: initialSegmentRawValue
+            initialSegmentRawValue: initialSegmentRawValue,
+            postStopResultHook: postStopResultHook
         )
     }
 
@@ -751,12 +1189,29 @@ final class OpenAIRealtimeSpeechProviderTests: XCTestCase {
     ) {
         let factory = TestSpeechTransportFactory()
         let provider = makeProvider(factory: factory)
-        let configuration = try makeConfiguration()
+        return try await makeConnectedProvider(
+            provider: provider,
+            factory: factory
+        )
+    }
+
+    private func makeConnectedProvider(
+        provider: OpenAIRealtimeSpeechProvider,
+        factory: TestSpeechTransportFactory,
+        flowID: AudioFlowID = .init()
+    ) async throws -> (
+        provider: OpenAIRealtimeSpeechProvider,
+        transport: TestSpeechSessionTransport,
+        configuration: SpeechSessionConfiguration,
+        channels: SpeechSessionChannels
+    ) {
+        let configuration = try makeConfiguration(flowID: flowID)
         let start = Task { @MainActor in
             try await provider.startSession(configuration)
         }
-        await waitUntil { factory.transports.count == 1 }
-        let transport = factory.transports[0]
+        let expectedTransportCount = factory.transports.count + 1
+        await waitUntil { factory.transports.count == expectedTransportCount }
+        let transport = factory.transports[expectedTransportCount - 1]
         transport.completeConnect()
         return (
             provider,
@@ -931,6 +1386,14 @@ private final class TestSpeechSessionTransport:
         OpenAIRealtimeCloseOutcome,
         Never
     >?
+    private struct PendingSend {
+        let payload: Data
+        let continuation: CheckedContinuation<
+            Result<Void, OpenAIRealtimeAudioChannelError>,
+            Never
+        >
+    }
+    private var pendingSend: PendingSend?
     private(set) var targetLanguage: String?
     private(set) var transcriptionRequested: Bool?
     private(set) var audioBinding: OpenAIRealtimeAudioBinding?
@@ -941,6 +1404,7 @@ private final class TestSpeechSessionTransport:
     private(set) var cancelCallCount = 0
     var closeOutcome: OpenAIRealtimeCloseOutcome = .serverAcknowledged
     var suspendsClose = false
+    var suspendsSend = false
     private var synchronousConnectEvents: [OpenAIRealtimeDecodedEvent]
 
     init(synchronousConnectEvents: [OpenAIRealtimeDecodedEvent]) {
@@ -949,6 +1413,7 @@ private final class TestSpeechSessionTransport:
 
     var isConnectPending: Bool { connectContinuation != nil }
     var isClosePending: Bool { closeContinuation != nil }
+    var isSendPending: Bool { pendingSend != nil }
 
     func connect(
         targetLanguage: String,
@@ -987,6 +1452,7 @@ private final class TestSpeechSessionTransport:
 
     func closeGracefully() async -> OpenAIRealtimeCloseOutcome {
         closeCallCount += 1
+        finishPendingSend(with: .failure(.transportClosed))
         if !suspendsClose { return closeOutcome }
         return await withCheckedContinuation { continuation in
             closeContinuation = continuation
@@ -997,6 +1463,7 @@ private final class TestSpeechSessionTransport:
     func cancelImmediately() -> OpenAIRealtimeCloseOutcome {
         cancelCallCount += 1
         failConnect(Self.connectionCancelledFailure)
+        finishPendingSend(with: .failure(.transportClosed))
         if let closeContinuation {
             self.closeContinuation = nil
             closeContinuation.resume(returning: .localImmediate)
@@ -1022,7 +1489,7 @@ private final class TestSpeechSessionTransport:
                 guard let self else {
                     throw OpenAIRealtimeAudioChannelError.transportClosed
                 }
-                await self.record(payload)
+                try await self.send(payload)
             },
             includeReceiver: includeDownlink
         )
@@ -1044,8 +1511,32 @@ private final class TestSpeechSessionTransport:
         onTerminal?(failure)
     }
 
-    private func record(_ payload: Data) {
-        sentPayloads.append(payload)
+    private func send(_ payload: Data) async throws {
+        guard suspendsSend else {
+            sentPayloads.append(payload)
+            return
+        }
+        let result: Result<Void, OpenAIRealtimeAudioChannelError> =
+            await withCheckedContinuation { continuation in
+                pendingSend = PendingSend(
+                    payload: payload,
+                    continuation: continuation
+                )
+            }
+        switch result {
+        case .success:
+            sentPayloads.append(payload)
+        case let .failure(error):
+            throw error
+        }
+    }
+
+    private func finishPendingSend(
+        with result: Result<Void, OpenAIRealtimeAudioChannelError>
+    ) {
+        guard let pendingSend else { return }
+        self.pendingSend = nil
+        pendingSend.continuation.resume(returning: result)
     }
 
     private static let connectionCancelledFailure = SpeechProviderFailure(
@@ -1069,6 +1560,26 @@ private final class SpeechEventProbe {
             }
             isComplete = true
         }
+    }
+}
+
+@available(iOS 18, macOS 15, *)
+@MainActor
+private final class StopResultGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var isWaiting = false
+
+    func wait() async {
+        isWaiting = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        let continuation = continuation
+        self.continuation = nil
+        continuation?.resume()
     }
 }
 
